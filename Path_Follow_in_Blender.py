@@ -10,7 +10,7 @@ bl_info = {
     'author': 'Xbman',
     'description': '选中路径和截面，路径为活动物体，选中后执行放样',
     'blender': (2, 80, 0),
-    'version': (1, 1, 2),
+    'version': (1, 1, 3),
     'location': '3D视图 > 侧边栏 > 路径跟随标签页',
     'category': '网格',
 }
@@ -3130,6 +3130,41 @@ class MESH_OT_punten_naar_mesh(bpy.types.Operator):
     def poll(cls, context):
         return context.mode in {'OBJECT', 'EDIT_MESH'}
 
+    # 多路径首次使用时的截面关系选择（含「不再提示」），仅在弹窗里用到
+    multi_profile_mode: bpy.props.EnumProperty(
+        name='多路径截面关系',
+        items=[
+            ('SHARED', '共用同一截面源', '所有路径引用同一个截面，编辑一次全部更新'),
+            ('COPY', '各自复制截面', '每条路径各持一份独立截面副本'),
+        ],
+        default='SHARED', options={'SKIP_SAVE'})
+    no_more_prompt: bpy.props.BoolProperty(
+        name='不再提示', default=False, options={'SKIP_SAVE'},
+        description='勾选后把上面的选择写入设置，以后直接按设置执行，不再弹窗询问')
+
+    def invoke(self, context, event):
+        # 仅在多路径（截面活动 + 多条路径选中）且尚未询问过时弹窗；其余情况直接执行
+        if (context.region is not None
+                and not IS_MULTI_GENERATING
+                and context.mode == 'OBJECT' and context.active_object
+                and context.active_object.type in {'CURVE', 'MESH'}
+                and (not context.active_object.get('gen_rail_name'))
+                and (not context.active_object.get('gen_profile_name'))):
+            try:
+                profile_src, rail_objs, _err = _get_path_active_selection(context, allow_multi=True)
+            except Exception:
+                profile_src, rail_objs = None, []
+            if profile_src and len(rail_objs) > 1 and not bool(context.scene.get('rail_multi_asked', False)):
+                self.multi_profile_mode = context.scene.rail_multi_profile
+                self.no_more_prompt = False
+                return context.window_manager.invoke_props_dialog(self)
+        return self.execute(context)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, 'multi_profile_mode', text='截面关系')
+        layout.prop(self, 'no_more_prompt', text='不再提示（以后按此设置执行）')
+
     @_rail_undo_transaction
     def execute(self, context):
         global IS_MULTI_GENERATING
@@ -3147,6 +3182,33 @@ class MESH_OT_punten_naar_mesh(bpy.types.Operator):
                 failed_names = []
                 align = scene.get('stored_align_pos', 'MM')
                 old_auto_update = bool(scene.get('rail_auto_update', False))
+                mode = self.multi_profile_mode if getattr(self, 'multi_profile_mode', 'SHARED') else 'SHARED'
+                if getattr(self, 'no_more_prompt', False):
+                    try:
+                        scene.rail_multi_profile = mode
+                        scene.rail_multi_asked = True
+                    except Exception:
+                        pass
+                _MULTI_PROP_BLACKLIST = [
+                    'gen_rail_name', 'gen_profile_name', 'gen_settings', 'gen_align_pos',
+                    'gen_direct_preview', 'gen_direct_inplace', 'gen_profile_consumed',
+                    'gen_direct_backup_mesh', 'gen_direct_backup_matrix',
+                    'gen_editable_profile_source', 'gen_source_generated_name',
+                    'gen_last_rail_matrix_world', 'gen_profile_anchor_world',
+                    'gen_profile_anchor_align_pos']
+                shared_src = None
+                if mode == 'SHARED':
+                    try:
+                        _rail_op(bpy.ops.object.select_all, action='DESELECT')
+                        profile_src.select_set(True)
+                        context.view_layer.objects.active = profile_src
+                        _rail_op(bpy.ops.object.duplicate)
+                        shared_src = context.object
+                        shared_src.name = f'{profile_src.name}·共用截面'
+                        _remove_custom_props(shared_src, _MULTI_PROP_BLACKLIST)
+                    except Exception as e:
+                        shared_src = None
+                        print('创建共用截面源失败，回退为各自复制:', e)
                 IS_MULTI_GENERATING = True
                 scene['rail_auto_update'] = False
                 if context.mode != 'OBJECT':
@@ -3154,18 +3216,15 @@ class MESH_OT_punten_naar_mesh(bpy.types.Operator):
                 for rail_ob in rail_objs:
                     try:
                         _rail_op(bpy.ops.object.select_all, action='DESELECT')
-                        profile_src.select_set(True)
-                        context.view_layer.objects.active = profile_src
+                        dup_from = shared_src if (mode == 'SHARED' and shared_src) else profile_src
+                        dup_from.select_set(True)
+                        context.view_layer.objects.active = dup_from
                         _rail_op(bpy.ops.object.duplicate)
                         profile_copy = context.object
-                        profile_copy.name = f'{profile_src.name}_截面源_{rail_ob.name}'
-                        _remove_custom_props(profile_copy, [
-                            'gen_rail_name', 'gen_profile_name', 'gen_settings', 'gen_align_pos',
-                            'gen_direct_preview', 'gen_direct_inplace', 'gen_profile_consumed',
-                            'gen_direct_backup_mesh', 'gen_direct_backup_matrix',
-                            'gen_editable_profile_source', 'gen_source_generated_name',
-                            'gen_last_rail_matrix_world', 'gen_profile_anchor_world',
-                            'gen_profile_anchor_align_pos'])
+                        profile_copy.name = (f'{profile_src.name}_tmp_{rail_ob.name}'
+                                             if mode == 'SHARED'
+                                             else f'{profile_src.name}_截面源_{rail_ob.name}')
+                        _remove_custom_props(profile_copy, _MULTI_PROP_BLACKLIST)
                         _rail_op(bpy.ops.object.select_all, action='DESELECT')
                         rail_ob.select_set(True)
                         profile_copy.select_set(True)
@@ -3184,10 +3243,21 @@ class MESH_OT_punten_naar_mesh(bpy.types.Operator):
                             continue
                         gen_name = scene.get('pre_last_generated', '')
                         gen_ob = bpy.data.objects.get(gen_name) if gen_name else None
-                        if gen_ob:
-                            generated_objs.append(gen_ob)
-                        else:
+                        if not gen_ob:
                             failed_names.append(rail_ob.name)
+                            continue
+                        if mode == 'SHARED' and shared_src:
+                            # 把所有路径的放样统一指向同一个共用截面源：
+                            # 编辑该截面即可让全部路径同步重新生成
+                            try:
+                                gen_ob['gen_profile_name'] = shared_src.name
+                            except Exception: pass
+                            # 临时副本已无用，删掉避免场景里堆满重复截面
+                            try:
+                                if bpy.data.objects.get(profile_copy.name):
+                                    bpy.data.objects.remove(profile_copy, do_unlink=True)
+                            except Exception: pass
+                        generated_objs.append(gen_ob)
                     except Exception as e:
                         failed_names.append(f'{rail_ob.name}({e})')
                         try:
@@ -3206,7 +3276,13 @@ class MESH_OT_punten_naar_mesh(bpy.types.Operator):
                                 obj.select_set(True)
                         context.view_layer.objects.active = generated_objs[-1]
                     except Exception: pass
-                    msg = f'已为 {len(generated_objs)} 条路径生成放样物体；每个放样物体都有独立可编辑截面'
+                    if mode == 'SHARED' and shared_src:
+                        msg = (f'已为 {len(generated_objs)} 条路径生成放样物体，'
+                               f'它们共用同一个截面源「{shared_src.name}」；'
+                               f'编辑该截面即可让全部路径同步更新')
+                    else:
+                        msg = (f'已为 {len(generated_objs)} 条路径生成放样物体；'
+                               f'每条路径各有独立可编辑截面')
                     if failed_names:
                         msg += f"；失败 {len(failed_names)} 条路径：{', '.join(failed_names[:5])}"
                     self.report({'INFO'}, msg)
@@ -3605,7 +3681,7 @@ _UI_TEXTS = {
         # 侧边栏分组标题（每个圈一组，可用小三角收纳 / 展开）
         'grp_align': '对齐轮廓', 'grp_update': '更新与朝向',
         'grp_mapping': '路径映射', 'grp_caps': '封口与拐角',
-        'grp_run': '执行',
+        'grp_run': '执行', 'grp_settings': '设置',
     },
     'en': {
         'lang': 'Interface Language',
@@ -3625,7 +3701,7 @@ _UI_TEXTS = {
         # Sidebar group titles
         'grp_align': 'Align Profile', 'grp_update': 'Update & Orientation',
         'grp_mapping': 'Path Mapping', 'grp_caps': 'Caps & Corners',
-        'grp_run': 'Run',
+        'grp_run': 'Run', 'grp_settings': 'Settings',
     },
 }
 
@@ -3893,6 +3969,27 @@ class VIEW_PT_pf_5_run(_PF_SUB_PANEL):
         col.operator('mesh.punten_naar_mesh', text=btn_text, icon='MOD_SCREW')
 
 
+class VIEW_PT_pf_6_settings(_PF_SUB_PANEL):
+    """多路径等默认行为的设置面板：可在此更改「一个截面对应多条路径」时的截面关系。"""
+    bl_label = _t('grp_settings')
+    bl_order = 6
+    _pf_header_icon = 'PREFERENCES'
+
+    def draw(self, context):
+        scene = context.scene
+        col = self.layout.column(align=True)
+        col.label(text='多路径（一个截面对应多条路径）')
+        col.prop(scene, 'rail_multi_profile', text='截面关系')
+        if scene.rail_multi_profile == 'SHARED':
+            col.label(text='所有路径共用同一个截面源，编辑一次全部更新', icon='INFO')
+        else:
+            col.label(text='每条路径各持独立截面副本，互不干扰', icon='INFO')
+        col.separator()
+        col.prop(scene, 'rail_multi_asked', text='下次不再弹窗询问')
+        if not scene.rail_multi_asked:
+            col.label(text='（首用多路径时仍会弹窗选择）', icon='TEXT')
+
+
 # ═══════════════════════════════════════════════════════════
 # 注册 / 注销
 # ═══════════════════════════════════════════════════════════
@@ -3904,7 +4001,7 @@ classes = [
     MESH_OT_reset_path_mapping, VIEW_PT_etrude_mesh,
     # 分组子面板：必须排在主面板之后注册，bl_parent_id 才能找到父面板
     VIEW_PT_pf_1_align, VIEW_PT_pf_2_update, VIEW_PT_pf_3_mapping,
-    VIEW_PT_pf_4_caps, VIEW_PT_pf_5_run,
+    VIEW_PT_pf_4_caps, VIEW_PT_pf_5_run, VIEW_PT_pf_6_settings,
     PATHFOLLOW_OT_toggle_language, PathFollowPreferences,
 ]
 
@@ -3915,6 +4012,7 @@ _PANEL_LABEL_KEYS = {
     VIEW_PT_pf_3_mapping: 'grp_mapping',
     VIEW_PT_pf_4_caps: 'grp_caps',
     VIEW_PT_pf_5_run: 'grp_run',
+    VIEW_PT_pf_6_settings: 'grp_settings',
 }
 
 # 算子在搜索菜单里的英文名称（英文界面时生效）
@@ -4033,6 +4131,20 @@ def register():
         description='执行路径跟随时，将原截面物体吸附到路径起点；'
                     '关闭时原截面保留在原位，放样使用其副本',
         default=False)
+    # 新增：多路径模式 —— 一个截面对应多条路径时，各路径截面之间的关系
+    bpy.types.Scene.rail_multi_profile = bpy.props.EnumProperty(
+        name='多路径截面关系',
+        description='一个截面同时对应多条路径时，各路径的截面如何关联',
+        items=[
+            ('SHARED', '共用同一截面源',
+             '所有路径引用同一个截面物体，编辑一次该截面、全部路径同步更新'),
+            ('COPY', '各自复制截面',
+             '每条路径各持一份独立截面副本，彼此互不干扰'),
+        ],
+        default='SHARED')
+    bpy.types.Scene.rail_multi_asked = bpy.props.BoolProperty(
+        name='多路径已询问', default=False,
+        description='首次多路径生成时弹窗询问过截面关系后自动置真，以后按上面的设置执行')
 
     if rail_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(rail_depsgraph_handler)
@@ -4105,6 +4217,10 @@ def unregister():
         del bpy.types.Scene.rail_auto_update
     if hasattr(bpy.types.Scene, 'rail_snap_profile_to_path'):
         del bpy.types.Scene.rail_snap_profile_to_path
+    if hasattr(bpy.types.Scene, 'rail_multi_profile'):
+        del bpy.types.Scene.rail_multi_profile
+    if hasattr(bpy.types.Scene, 'rail_multi_asked'):
+        del bpy.types.Scene.rail_multi_asked
 
 if __name__ == '__main__':
     register()
