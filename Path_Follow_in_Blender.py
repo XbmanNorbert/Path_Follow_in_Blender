@@ -10,7 +10,7 @@ bl_info = {
     'author': 'Xbman',
     'description': '选中路径和截面，路径为活动物体，选中后执行放样',
     'blender': (2, 80, 0),
-    'version': (1, 0, 0),
+    'version': (1, 0, 1),
     'location': '3D视图 > 侧边栏 > 路径跟随标签页',
     'category': '网格',
 }
@@ -645,15 +645,65 @@ def _get_modifier_identifier(modifier, input_name):
             if item.name == input_name: return item.identifier
     return None
 
+def _modifier_supports_idprops(modifier):
+    try:
+        modifier.keys()
+    except TypeError:
+        return False
+    except Exception:
+        return True
+    return True
+
+def _modifier_input_keys(modifier):
+    props = getattr(modifier, 'properties', None)
+    inputs = getattr(props, 'inputs', None) if props else None
+    if inputs is not None:
+        try: return list(inputs.keys())
+        except Exception: pass
+    if _modifier_supports_idprops(modifier):
+        try: return list(modifier.keys())
+        except Exception: pass
+    return []
+
+def get_modifier_input_value(modifier, identifier, default=None):
+    if not modifier or not identifier: return default
+    props = getattr(modifier, 'properties', None)
+    inputs = getattr(props, 'inputs', None) if props else None
+    if inputs is not None and identifier in inputs.keys():
+        try: return getattr(inputs, identifier).value
+        except Exception: return default
+    if _modifier_supports_idprops(modifier) and identifier in modifier:
+        try: return modifier[identifier]
+        except Exception: return default
+    return default
+
+def set_modifier_input_value(modifier, identifier, value):
+    if not modifier or not identifier: return False
+    props = getattr(modifier, 'properties', None)
+    inputs = getattr(props, 'inputs', None) if props else None
+    if inputs is not None and identifier in inputs.keys():
+        try:
+            getattr(inputs, identifier).value = value
+            return True
+        except Exception:
+            return False
+    if _modifier_supports_idprops(modifier):
+        try:
+            modifier[identifier] = value
+            return True
+        except Exception:
+            pass
+    return False
+
 def get_resolution_proxy(self):
     rail = find_active_rail(bpy.context)
     if rail:
         mod = rail.modifiers.get('Path_Resample')
         if mod and mod.node_group:
             identifier = _get_modifier_identifier(mod, 'Count')
-            if identifier and identifier in mod: return mod[identifier]
-            if 'Count' in mod: return mod['Count']
-            if 'Input_2' in mod: return mod['Input_2']
+            for key in (identifier, 'Count', 'Input_2'):
+                value = get_modifier_input_value(mod, key)
+                if value is not None: return value
     return _internal_resolution
 
 def set_resolution_proxy(self, value):
@@ -1276,17 +1326,17 @@ def apply_resample_modifier(obj, resolution_count):
     mod.node_group = node_group
     try:
         identifier = _get_modifier_identifier(mod, 'Count')
-        if identifier:
-            mod[identifier] = resolution_count
-        else:
-            updated = False
-            for key in mod.keys():
+        updated = False
+        if identifier and set_modifier_input_value(mod, identifier, resolution_count):
+            updated = True
+        if not updated:
+            for key in _modifier_input_keys(mod):
                 if (key not in ('name', 'show_viewport', 'show_render')
-                        and (key == 'Count' or (key.startswith('Input') and isinstance(mod[key], int)))):
-                    mod[key] = resolution_count
-                    updated = True; break
-            if not updated:
-                mod['Count'] = resolution_count
+                        and (key == 'Count' or (key.startswith('Input') and isinstance(get_modifier_input_value(mod, key), int)))):
+                    if set_modifier_input_value(mod, key, resolution_count):
+                        updated = True; break
+        if not updated:
+            set_modifier_input_value(mod, 'Count', resolution_count)
     except Exception as e:
         print(f'设置采样数值出错: {e}')
     obj.update_tag()
@@ -2083,7 +2133,16 @@ class MESH_OT_profiel_vlak(bpy.types.Operator):
         is_separate_object = profile_ob != rail_ob
         editable_realign_mode = (is_update_mode and _is_editable_profile_source(profile_ob)
                                  and (not self.target_name or force_realign_editable_on_update))
-        use_direct_profile_object = (not is_update_mode and is_separate_object) or direct_rebuild_mode or editable_realign_mode
+
+        # 读取"截面吸附到路径"开关：
+        #   True  = 吸附模式（原截面被移动到路径起点，兼容旧行为）
+        #   False = 复制模式（原截面保留在原地，放样物使用其副本）
+        snap_profile_to_path = bool(getattr(scene, 'rail_snap_profile_to_path', True))
+        use_direct_profile_object = (
+            (not is_update_mode and is_separate_object and snap_profile_to_path)
+            or direct_rebuild_mode
+            or (editable_realign_mode and snap_profile_to_path)
+        )
 
         if (is_update_mode and _is_editable_profile_source(profile_ob)
                 and self.target_name and (not force_realign_editable_on_update)):
@@ -2094,7 +2153,8 @@ class MESH_OT_profiel_vlak(bpy.types.Operator):
             if context.mode != 'OBJECT':
                 _rail_op(bpy.ops.object.mode_set, mode='OBJECT')
             realtime_align_pos = scene.get('stored_align_pos', self.align_pos)
-            if align_editable_copy_to_path:
+            # 吸附模式：移动原截面到路径起点
+            if align_editable_copy_to_path and snap_profile_to_path:
                 if mapping_full_realign_on_update:
                     _align_mesh_copy_to_current_path_start(src_profile, scene, realtime_align_pos)
                 else:
@@ -2105,6 +2165,12 @@ class MESH_OT_profiel_vlak(bpy.types.Operator):
             naar_collectie(extrusion_ob)
             _force_mesh_object_world_space_identity(extrusion_ob)
             _copy_profile_anchor_state(src_profile, extrusion_ob)
+            # 非吸附模式：改为移动副本到路径起点（原截面保持原地不动）
+            if align_editable_copy_to_path and not snap_profile_to_path:
+                if mapping_full_realign_on_update:
+                    _align_mesh_copy_to_current_path_start(extrusion_ob, scene, realtime_align_pos)
+                else:
+                    _move_editable_profile_anchor_to_current_path_start(extrusion_ob, scene, realtime_align_pos)
             _remove_custom_props(extrusion_ob, [
                 'gen_direct_preview', 'gen_direct_inplace', 'gen_profile_consumed',
                 'gen_direct_backup_mesh', 'gen_direct_backup_matrix',
@@ -2332,7 +2398,7 @@ class MESH_OT_profiel_vlak(bpy.types.Operator):
         _set_gen_settings(extrusion_ob, _current_gen_settings_from_scene(scene))
         _store_rail_matrix_state(profile_ob, extrusion_ob, rail_ob)
 
-        if editable_realign_mode:
+        if editable_realign_mode and snap_profile_to_path:
             src_profile = extrusion_ob
             try: _rail_op(bpy.ops.object.mode_set, mode='OBJECT')
             except Exception: pass
@@ -3126,6 +3192,14 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
         row = col.row(align=True)
         row.scale_y = 1.2
         row.prop(scene, 'rail_make_loop', text='闭合路径', toggle=True, icon='MESH_CIRCLE')
+        # 截面吸附开关
+        snap = bool(getattr(scene, 'rail_snap_profile_to_path', True))
+        row = col.row(align=True)
+        row.scale_y = 1.2
+        row.prop(scene, 'rail_snap_profile_to_path',
+                 text='截面吸附到路径',
+                 toggle=True,
+                 icon='CHECKBOX_HLT' if snap else 'CHECKBOX_DEHLT')
         col = layout.column()
         col.scale_y = 2.2
         btn_text = '执行路径跟随'
@@ -3185,6 +3259,12 @@ def register():
     bpy.types.Scene.rail_auto_update = bpy.props.BoolProperty(
         name='自动更新', description='编辑路径或轮廓时，自动更新挤出模型',
         default=False, update=update_gen_mesh)
+    # 新增：截面吸附开关
+    bpy.types.Scene.rail_snap_profile_to_path = bpy.props.BoolProperty(
+        name='截面吸附到路径',
+        description='执行路径跟随时，将原截面物体吸附到路径起点；'
+                    '关闭时原截面保留在原位，放样使用其副本',
+        default=True)
 
     if rail_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(rail_depsgraph_handler)
@@ -3247,6 +3327,8 @@ def unregister():
     del bpy.types.Scene.rail_map_end
     if hasattr(bpy.types.Scene, 'rail_auto_update'):
         del bpy.types.Scene.rail_auto_update
+    if hasattr(bpy.types.Scene, 'rail_snap_profile_to_path'):
+        del bpy.types.Scene.rail_snap_profile_to_path
 
 if __name__ == '__main__':
     register()
