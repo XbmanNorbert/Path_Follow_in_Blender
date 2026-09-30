@@ -10,7 +10,7 @@ bl_info = {
     'author': 'Xbman',
     'description': '选中路径和截面，路径为活动物体，选中后执行放样',
     'blender': (2, 80, 0),
-    'version': (1, 2, 0),
+    'version': (1, 2, 1),
     'location': '3D视图 > 侧边栏 > 路径跟随标签页',
     'category': '网格',
 }
@@ -1957,7 +1957,8 @@ def _move_editable_profile_anchor_to_current_path_start(profile_ob, scene, align
         profile_ob.matrix_world = Matrix.Identity(4)
         _store_profile_anchor_state(profile_ob, begin_punt, align_pos)
         profile_ob.update_tag()
-        _set_mesh_origin_to_bounds_center_keep_world(profile_ob)
+        if align_pos != 'ORIGIN':
+            _set_mesh_origin_to_bounds_center_keep_world(profile_ob)
         return True
     except Exception as e:
         print(f'同步可编辑截面到新路径起点失败: {e}')
@@ -2061,18 +2062,21 @@ def _align_mesh_copy_to_current_path_start(obj, scene, align_pos='MM'):
     geo_center_x = (min_x + max_x) / 2
     geo_center_y = (min_y + max_y) / 2
 
-    if 'L' in align_pos: off_x = min_x
-    elif 'R' in align_pos: off_x = max_x
-    else: off_x = geo_center_x
-    if 'T' in align_pos: off_y = max_y
-    elif 'B' in align_pos: off_y = min_y
-    else: off_y = geo_center_y
-
-    stored_anchor = _prop_list_to_vec(obj.get('gen_profile_anchor_world'), None)
-    if stored_anchor is not None:
-        anchor_point = stored_anchor
+    if align_pos == 'ORIGIN':
+        anchor_point = Vector((0.0, 0.0, 0.0))
     else:
-        anchor_point = midden + tangent_x * off_x + tangent_y * off_y
+        if 'L' in align_pos: off_x = min_x
+        elif 'R' in align_pos: off_x = max_x
+        else: off_x = geo_center_x
+        if 'T' in align_pos: off_y = max_y
+        elif 'B' in align_pos: off_y = min_y
+        else: off_y = geo_center_y
+
+        stored_anchor = _prop_list_to_vec(obj.get('gen_profile_anchor_world'), None)
+        if stored_anchor is not None:
+            anchor_point = stored_anchor
+        else:
+            anchor_point = midden + tangent_x * off_x + tangent_y * off_y
 
     target_fwd = v_rail.normalized()
     if scene.get('rail_z_up', False):
@@ -2105,7 +2109,8 @@ def _align_mesh_copy_to_current_path_start(obj, scene, align_pos='MM'):
     obj.matrix_world = Matrix.Identity(4)
     obj.update_tag()
     _store_profile_anchor_state(obj, begin_punt, align_pos)
-    _set_mesh_origin_to_bounds_center_keep_world(obj)
+    if align_pos != 'ORIGIN':
+        _set_mesh_origin_to_bounds_center_keep_world(obj)
     bm.free()
     return True
 
@@ -2332,6 +2337,7 @@ class MESH_OT_profiel_vlak(bpy.types.Operator):
         ('TL', '左上', ''), ('TM', '上中', ''), ('TR', '右上', ''),
         ('ML', '左中', ''), ('MM', '居中', ''), ('MR', '右中', ''),
         ('BL', '左下', ''), ('BM', '下中', ''), ('BR', '右下', ''),
+        ('ORIGIN', '原点', ''),
     ], default='MM')
     target_name: bpy.props.StringProperty(options={'HIDDEN'})
     align_editable_copy_to_path: bpy.props.BoolProperty(default=False, options={'HIDDEN'})
@@ -2777,12 +2783,14 @@ class MESH_OT_profiel_vlak(bpy.types.Operator):
                 midden = selected_verts[0].co
                 normaal = Vector((0, 0, 1))
 
+        align_by_origin = (self.align_pos == 'ORIGIN')
+        rot_pivot = Vector((0.0, 0.0, 0.0)) if align_by_origin else midden
         rot_steps = scene.get('rail_profile_rotation', 0)
         if rot_steps != 0:
             rot_angle = math.radians(90 * rot_steps)
             rot_mat = Matrix.Rotation(rot_angle, 4, normaal)
-            mat_trans_to = Matrix.Translation(-midden)
-            mat_trans_from = Matrix.Translation(midden)
+            mat_trans_to = Matrix.Translation(-rot_pivot)
+            mat_trans_from = Matrix.Translation(rot_pivot)
             final_rot = mat_trans_from @ rot_mat @ mat_trans_to
             bmesh.ops.transform(bm, matrix=final_rot, verts=selected_verts)
             bm.normal_update()
@@ -2806,15 +2814,19 @@ class MESH_OT_profiel_vlak(bpy.types.Operator):
         geo_center_y = (min_y + max_y) / 2
 
         align = self.align_pos
-        if 'L' in align: off_x = min_x
-        elif 'R' in align: off_x = max_x
-        else: off_x = geo_center_x
-        if 'T' in align: off_y = max_y
-        elif 'B' in align: off_y = min_y
-        else: off_y = geo_center_y
+        if align == 'ORIGIN':
+            # 以截面自身的局部原点 (0,0,0) 作为锚点，使其落在路径起点
+            anchor_point = Vector((0.0, 0.0, 0.0))
+        else:
+            if 'L' in align: off_x = min_x
+            elif 'R' in align: off_x = max_x
+            else: off_x = geo_center_x
+            if 'T' in align: off_y = max_y
+            elif 'B' in align: off_y = min_y
+            else: off_y = geo_center_y
 
-        anchor_offset = tangent_x * off_x + tangent_y * off_y
-        anchor_point = midden + anchor_offset
+            anchor_offset = tangent_x * off_x + tangent_y * off_y
+            anchor_point = midden + anchor_offset
         target_fwd = v_rail.normalized()
 
         is_z_up = scene.get('rail_z_up', False)
@@ -2851,7 +2863,7 @@ class MESH_OT_profiel_vlak(bpy.types.Operator):
         context.view_layer.objects.active = ob
         scene['stored_align_pos'] = self.align_pos
         _store_profile_anchor_state(extrusion_ob, begin_punt, self.align_pos)
-        if use_direct_profile_object and (not direct_rebuild_mode):
+        if use_direct_profile_object and (not direct_rebuild_mode) and (not align_by_origin):
             _set_mesh_origin_to_bounds_center_keep_world(extrusion_ob)
         extrusion_ob['gen_align_pos'] = self.align_pos
         _set_gen_settings(extrusion_ob, _current_gen_settings_from_scene(scene))
@@ -3682,6 +3694,8 @@ _UI_TEXTS = {
         'grp_align': '对齐轮廓', 'grp_update': '更新与朝向',
         'grp_mapping': '路径映射', 'grp_caps': '封口与拐角',
         'grp_run': '执行', 'grp_settings': '设置',
+        'align_origin': '原点对齐', 'align_origin_hint': '让截面原点落在路径起点',
+        'lang_label': '界面语言',
     },
     'en': {
         'lang': 'Interface Language',
@@ -3702,6 +3716,8 @@ _UI_TEXTS = {
         'grp_align': 'Align Profile', 'grp_update': 'Update & Orientation',
         'grp_mapping': 'Path Mapping', 'grp_caps': 'Caps & Corners',
         'grp_run': 'Run', 'grp_settings': 'Settings',
+        'align_origin': 'Align to Origin', 'align_origin_hint': 'Place profile origin on path start',
+        'lang_label': 'Language',
     },
 }
 
@@ -3781,15 +3797,6 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
     # 默认展开：不加 'DEFAULT_CLOSED'，勾选面板后直接显示全部控件
     bl_options = set()
 
-    def draw_header(self, context):
-        # 面板右上角：仅图标的语言切换按钮
-        try:
-            if _ui_preferences() is not None:
-                self.layout.operator('pathfollow.toggle_language',
-                                     text='', icon='WORLD')
-        except Exception:
-            pass
-
     def draw(self, context):
         try: _sync_mapping_panel_to_active(context)
         except Exception: pass
@@ -3863,6 +3870,12 @@ class VIEW_PT_pf_1_align(_PF_SUB_PANEL):
         row.operator('mesh.profiel_vlak', text='↙').align_pos = 'BL'
         row.operator('mesh.profiel_vlak', text='↓').align_pos = 'BM'
         row.operator('mesh.profiel_vlak', text='↘').align_pos = 'BR'
+        col.separator()
+        row = col.row(align=True)
+        row.scale_y = 1.15
+        row.operator('mesh.profiel_vlak', text=_t('align_origin'),
+                     icon='OBJECT_ORIGIN').align_pos = 'ORIGIN'
+        col.label(text=_t('align_origin_hint'))
 
 
 class VIEW_PT_pf_2_update(_PF_SUB_PANEL):
@@ -3969,15 +3982,22 @@ class VIEW_PT_pf_5_run(_PF_SUB_PANEL):
         col.operator('mesh.punten_naar_mesh', text=btn_text, icon='MOD_SCREW')
 
 
-class VIEW_PT_pf_6_settings(_PF_SUB_PANEL):
+class VIEW_PT_pf_0_settings(_PF_SUB_PANEL):
     """多路径等默认行为的设置面板：可在此更改「一个截面对应多条路径」时的截面关系。"""
     bl_label = _t('grp_settings')
-    bl_order = 6
+    bl_order = 0
     _pf_header_icon = 'PREFERENCES'
 
     def draw(self, context):
         scene = context.scene
         col = self.layout.column(align=True)
+        # 语言切换：当前中文显示“中”，英文显示“EN”
+        lang = _ui_lang()
+        row = col.row(align=True)
+        row.scale_y = 1.15
+        row.operator('pathfollow.toggle_language', text=('中' if lang == 'zh' else 'EN'))
+        row.label(text=_t('lang_label'))
+        col.separator()
         col.label(text='多路径（一个截面对应多条路径）')
         col.prop(scene, 'rail_multi_profile', text='截面关系')
         if scene.rail_multi_profile == 'SHARED':
@@ -4001,7 +4021,7 @@ classes = [
     MESH_OT_reset_path_mapping, VIEW_PT_etrude_mesh,
     # 分组子面板：必须排在主面板之后注册，bl_parent_id 才能找到父面板
     VIEW_PT_pf_1_align, VIEW_PT_pf_2_update, VIEW_PT_pf_3_mapping,
-    VIEW_PT_pf_4_caps, VIEW_PT_pf_5_run, VIEW_PT_pf_6_settings,
+    VIEW_PT_pf_4_caps, VIEW_PT_pf_5_run, VIEW_PT_pf_0_settings,
     PATHFOLLOW_OT_toggle_language, PathFollowPreferences,
 ]
 
@@ -4012,7 +4032,7 @@ _PANEL_LABEL_KEYS = {
     VIEW_PT_pf_3_mapping: 'grp_mapping',
     VIEW_PT_pf_4_caps: 'grp_caps',
     VIEW_PT_pf_5_run: 'grp_run',
-    VIEW_PT_pf_6_settings: 'grp_settings',
+    VIEW_PT_pf_0_settings: 'grp_settings',
 }
 
 # 算子在搜索菜单里的英文名称（英文界面时生效）
