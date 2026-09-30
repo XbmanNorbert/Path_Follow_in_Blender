@@ -10,7 +10,7 @@ bl_info = {
     'author': 'Xbman',
     'description': '选中路径和截面，路径为活动物体，选中后执行放样',
     'blender': (2, 80, 0),
-    'version': (1, 1, 3),
+    'version': (1, 2, 0),
     'location': '3D视图 > 侧边栏 > 路径跟随标签页',
     'category': '网格',
 }
