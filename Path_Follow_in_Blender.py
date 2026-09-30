@@ -10,7 +10,7 @@ bl_info = {
     'author': 'Xbman',
     'description': '选中路径和截面，路径为活动物体，选中后执行放样',
     'blender': (2, 80, 0),
-    'version': (1, 1, 0),
+    'version': (1, 1, 1),
     'location': '3D视图 > 侧边栏 > 路径跟随标签页',
     'category': '网格',
 }
@@ -1153,6 +1153,200 @@ def _calc_open_path_normals(points):
     normals.append(segs[-1].normalized())
     return clean_points, normals
 
+_CORNER_LOOKAHEAD = 3
+_CORNER_LINE_TOL = math.radians(8.0)
+
+def _unit_dir(vec):
+    try:
+        return vec.normalized() if vec.length > 1e-09 else None
+    except Exception:
+        return None
+
+def _line_line_intersection(origin_a, dir_a, origin_b, dir_b):
+    """两条直线（点 + 方向）求交；近似平行返回 None。"""
+    try:
+        hits = mathutils.geometry.intersect_line_line(
+            origin_a, origin_a + dir_a, origin_b, origin_b + dir_b)
+    except Exception:
+        return None
+    if not hits:
+        return None
+    return (Vector(hits[0]) + Vector(hits[1])) * 0.5
+
+def _straight_run_anchor(points, start, step, dir_ref, span):
+    """从 start 出发沿 step 方向延伸，返回仍与 dir_ref 近似共线的最后一个索引。
+    用于在拐角两侧找回原始直线段，避免用跨过拐角的斜切弦当方向。
+
+    注意：step 为 -1（向前追溯）时 points[k] - points[j] 与行进方向相反，
+    必须按行进方向取反后再与 dir_ref 比较，否则夹角恒为 180°、延伸永远立即中断。"""
+    n = len(points)
+    j = start
+    for _ in range(max(1, int(span))):
+        k = j + step
+        if k < 0 or k > n - 1:
+            break
+        cand = _unit_dir((Vector(points[k]) - Vector(points[j])) * step)
+        if cand is None:
+            break
+        try:
+            if cand.angle(dir_ref, 0.0) > _CORNER_LINE_TOL:
+                break
+        except Exception:
+            break
+        j = k
+    return j
+
+def _chord_turn_at(points, i):
+    """相邻弦转角（局部量）：只用于拐角检测，平滑折线上不会误报拐角。"""
+    n = len(points)
+    if i <= 0 or i >= n - 1:
+        return -1.0
+    a = _unit_dir(Vector(points[i]) - Vector(points[i - 1]))
+    b = _unit_dir(Vector(points[i + 1]) - Vector(points[i]))
+    if a is None or b is None:
+        return -1.0
+    try:
+        return a.angle(b, 0.0)
+    except Exception:
+        return -1.0
+
+def _corner_geometry(points, i, lookahead=_CORNER_LOOKAHEAD):
+    """求第 i 个采样点处的真实拐角，返回
+    (corner, d_in, d_out, turn, avail_in, avail_out)；非拐角返回 None。
+
+    avail_in / avail_out 为拐角两侧可共线的直线段长度（从角点到最远共线采样点），
+    圆角半径以它为基准，因此圆角大小不再受"采样点恰好落在角点附近"的偶然性影响。
+
+    重采样点通常不会正好落在原始折线的拐角上（拐角常夹在两个相邻采样点之间），
+    此时直接量"相邻弦"的转角只有真实值的一半，斜切基准点也会偏。
+    这里假设拐角夹在 P[i] 与 P[i+1] 之间（检测也只取拐角平台最靠前的采样点），
+    于是 P[i] 及更早都在进入直线上、P[i+1] 及更晚都在离开直线上：分别向两侧
+    延伸共线段，用两条真实直线求交得到拐角位置，再由角点与两侧采样点得到精确的
+    进入 / 离开方向，转角取两条直线方向的夹角（拐角处精确，平滑处仍是局部小角度）。"""
+    n = len(points)
+    if n < 4 or i <= 0 or i >= n - 1:
+        return None
+    span = max(1, int(lookahead))
+    dir_in_ref = _unit_dir(Vector(points[i]) - Vector(points[i - 1]))
+    if dir_in_ref is None:
+        return None
+    anchor_in = _straight_run_anchor(points, i, -1, dir_in_ref, span)
+    dir_in = _unit_dir(Vector(points[i]) - Vector(points[anchor_in])) or dir_in_ref
+
+    dir_out_ref = _unit_dir(Vector(points[min(n - 1, i + 2)]) - Vector(points[i + 1]))
+    if dir_out_ref is None:
+        dir_out_ref = _unit_dir(Vector(points[i + 1]) - Vector(points[i]))
+    if dir_out_ref is None:
+        return None
+    anchor_out = _straight_run_anchor(points, i + 1, 1, dir_out_ref, span)
+    dir_out = _unit_dir(Vector(points[anchor_out]) - Vector(points[i + 1])) or dir_out_ref
+
+    corner = _line_line_intersection(Vector(points[anchor_in]), dir_in,
+                                     Vector(points[i + 1]), dir_out)
+    if corner is None:
+        corner = Vector(points[i])
+    # 进入 / 离开方向以"两侧直线段"为准：采样点可能正好落在角点上、甚至已经越过角点，
+    # 此时 corner - P[i] 长度趋零、方向是数值噪声，必须回退到直线段方向。
+    d_in = _unit_dir(corner - Vector(points[i]))
+    if d_in is None or d_in.dot(dir_in) < 0.999:
+        d_in = dir_in
+    d_out = _unit_dir(Vector(points[i + 1]) - corner)
+    if d_out is None or d_out.dot(dir_out) < 0.999:
+        d_out = dir_out
+    try:
+        turn = dir_in.angle(dir_out, 0.0)
+    except Exception:
+        return None
+    if turn <= 1e-06 or turn >= math.pi - 1e-06:
+        return None
+    avail_in = (corner - Vector(points[anchor_in])).length
+    avail_out = (Vector(points[anchor_out]) - corner).length
+    return corner, d_in, d_out, turn, avail_in, avail_out
+
+def _has_straight_runs(points, i, span=_CORNER_LOOKAHEAD):
+    """两侧是否都各有一段（至少两个采样间距）与相邻弦共线的原始直线段。
+    真正的折线拐角两侧都有直线段；平滑弯曲路径上相邻弦方向一直在变，只能延伸
+    一步（就是同一根弦本身），这里会返回 False，从而避免把平滑段误判成拐角。
+    注意：延伸一步恒成功，因此判据必须要求每侧至少两步，否则形同虚设（恒真）。"""
+    n = len(points)
+    if n < 6 or i <= 1 or i >= n - 2:
+        return False
+    dir_in = _unit_dir(Vector(points[i]) - Vector(points[i - 1]))
+    dir_out = _unit_dir(Vector(points[min(n - 1, i + 2)]) - Vector(points[i + 1]))
+    if dir_out is None:
+        dir_out = _unit_dir(Vector(points[i + 1]) - Vector(points[i]))
+    if dir_in is None or dir_out is None:
+        return False
+    anchor_in = _straight_run_anchor(points, i, -1, dir_in, span)
+    anchor_out = _straight_run_anchor(points, i + 1, 1, dir_out, span)
+    return anchor_in <= i - 2 and anchor_out >= i + 3
+
+def _angle_at_least(value, thr):
+    """转角是否达到阈值。带相对容差：采样点本身有浮点误差，直接比较会让
+    "转角恰好等于阈值"的拐角时灵时不灵（量出 29.999994° 就漏检 30° 阈值）。"""
+    try:
+        value = float(value)
+        thr = float(thr)
+    except Exception:
+        return False
+    return value >= thr - max(1e-09, abs(thr) * 1e-06)
+
+def _is_corner_candidate(points, i, thr, local_turn=None):
+    """判断 i 处是否为折线拐角：真实转角 ≥ 阈值，且要么相邻弦转角本身已超阈值
+    （重采样很粗的情况），要么两侧确实各有一段直线（避免平滑弯道被误判）。
+    命中返回 _corner_geometry 的结果，否则返回 None。"""
+    local = _chord_turn_at(points, i) if local_turn is None else local_turn
+    if local <= 1e-06:
+        return None
+    geo = _corner_geometry(points, i)
+    if geo is None or not _angle_at_least(geo[3], thr):
+        return None
+    if _angle_at_least(local, thr) or _has_straight_runs(points, i):
+        return geo
+    return None
+
+def _local_spacing(points, i):
+    """第 i 点附近的采样间距，用于判断两个候选点是否指向同一个真实拐角。"""
+    n = len(points)
+    vals = []
+    if i > 0:
+        vals.append((Vector(points[i]) - Vector(points[i - 1])).length)
+    if 0 <= i < n - 1:
+        vals.append((Vector(points[i + 1]) - Vector(points[i])).length)
+    return max(vals) if vals else 0.0
+
+def _detect_corner_indices(points, thr):
+    """找拐角采样点：判据见 _is_corner_candidate。同一个真实拐角常让相邻两个
+    采样点都命中（一个在角点前、一个在角点后），这里按"反推出的角点位置"去重，
+    只保留最靠前的那个——它前面必定还是原始直线段，弧才能正确地从直线段切出。
+    返回 (indices, turns)。"""
+    n_pts = len(points)
+    local_turns = [_chord_turn_at(points, i) for i in range(n_pts)]
+    indices = []
+    corners = []
+    for i in range(1, n_pts - 1):
+        geo = _is_corner_candidate(points, i, thr, local_turns[i])
+        if geo is None:
+            continue
+        corner = Vector(geo[0])
+        merged = False
+        for k in range(len(indices) - 1, -1, -1):
+            # 角点后的采样点会凭"斜切弦"量出一个偏小的假拐角，位置就在真拐角旁边，
+            # 因此去重半径要放宽到约两个采样间距。
+            eps = max(_local_spacing(points, i), _local_spacing(points, indices[k])) * 2.0
+            if (corner - corners[k]).length <= max(1e-06, eps):
+                if i < indices[k]:
+                    indices[k] = i
+                    corners[k] = corner
+                merged = True
+                break
+        if merged:
+            continue
+        indices.append(i)
+        corners.append(corner)
+    indices.sort()
+    return indices, local_turns
+
 def _sharpen_corners(points, normals, vecs, angle_threshold_rad, is_looping=False):
     """拐角锐化：拐角重建（snap 已在上游完成）后，拐角处使用平分斜接
     （标准弯头，左右对称、水密无缺口）。此函数只需透传，
@@ -1162,11 +1356,16 @@ def _sharpen_corners(points, normals, vecs, angle_threshold_rad, is_looping=Fals
 
 def _round_path_corners(points, normals, vecs, angle_threshold_rad,
                         arc_segments, radius_factor=0.35, is_looping=False):
-    """拐角圆角：把尖角替换为一段圆弧（圆角/倒角）。
-    arc_segments 为圆弧分段数，radius_factor 为圆角半径占较短邻段长度的比例。
-    只处理转角局部峰值点，且圆角之间保持最小间距，避免连续多点各自触发
-    圆角导致弧段堆叠（扇形堆积）。
-    返回 (points, normals, vecs, None)。"""
+    """拐角圆角：把尖角替换为一段真正相切的圆弧（圆角 / 倒角）。
+
+    arc_segments 为圆弧分段数；radius_factor 为圆角半径占较短邻段长度的比例。
+    切点距角点 T = r·tan(θ/2)（θ 为转角），并限制在相邻采样点之内（0.49 倍），
+    保证点列单调、不反向；圆心 O = C + n̂·(T / sin(θ/2))，n̂ = normalize(d_out - d_in)
+    指向弯折内侧，弧上各点到 O 的距离恒为 r，弧首末分别与进入 / 离开段相切。
+
+    弧上每一步同时返回"绕圆心的刚体旋转"（rot_steps），由放样器直接旋转截面推进，
+    而不是按斜切投影，因此厚截面在拐角处不会被剪切 / 自交，不会出现破洞与扇形裂缝。
+    返回 (points, normals, vecs, rot_steps)。"""
     try: arc_segments = int(arc_segments)
     except Exception: return points, normals, vecs, None
     try: radius_factor = float(radius_factor)
@@ -1178,93 +1377,101 @@ def _round_path_corners(points, normals, vecs, angle_threshold_rad,
         return points, normals, vecs, None
     try: thr = float(angle_threshold_rad)
     except Exception: thr = math.radians(30.0)
+    if thr <= 1e-09:
+        return points, normals, vecs, None
     radius_factor = max(0.02, min(0.45, radius_factor))
-    # 1) 计算每个内部点的转角
-    turns = []
-    for i in range(1, n_pts - 1):
-        v_in = Vector(vecs[i - 1])
-        v_out = Vector(vecs[i])
-        l_in = v_in.length
-        l_out = v_out.length
-        t = -1.0
-        if l_in > 1e-09 and l_out > 1e-09:
-            try: t = (v_in / l_in).angle(v_out / l_out, 0.0)
-            except Exception: t = -1.0
-        turns.append(t)
-    # 2) 选出拐角点：局部峰值 + 最小间距（避免相邻多点连续触发）。
-    #    圆角切点最多吃掉邻段的 49%，因此相距 >=2 的拐角不会重叠，
-    #    间距只需 2（防止紧邻两点重复触发）。
-    corner_indices = []
-    handled_until = -1
-    min_gap = 2
-    for idx, i in enumerate(range(1, n_pts - 1)):
-        if i <= handled_until:
-            continue
-        t = turns[idx]
-        if t < thr or t <= 1e-06 or t >= math.pi - 1e-06:
-            continue
-        t_prev = turns[idx - 1] if idx > 0 else -1.0
-        t_next = turns[idx + 1] if idx + 1 < len(turns) else -1.0
-        if t < t_prev or t < t_next:
-            continue  # 不是局部峰值，交给邻近峰值点处理
-        corner_indices.append(i)
-        handled_until = i + min_gap
+    # 1) 找拐角（用真实直线方向量转角，避免拐角夹在两个采样点之间时转角被减半）
+    corner_indices, _turns = _detect_corner_indices(points, thr)
     if not corner_indices:
         return points, normals, vecs, None
-    corner_set = set(corner_indices)
-    # 3) 生成圆弧
+    geometry = {}
+    for i in corner_indices:
+        geo = _is_corner_candidate(points, i, thr, _turns[i])
+        if geo:
+            geometry[i] = geo
+    if not geometry:
+        return points, normals, vecs, None
+    # 2) 逐点重建：拐角点替换为弧点，并记录弧上每一步的刚体旋转
     new_points = [Vector(points[0])]
     new_normals = [Vector(normals[0])]
+    rot_steps = {}
+    arc_start_normals = []
+    drop_until = -1
     for i in range(1, n_pts - 1):
-        if i not in corner_set:
+        if i <= drop_until:
+            continue  # 已被上一个圆角吞掉的采样点
+        geo = geometry.get(i)
+        if geo is None:
             new_points.append(Vector(points[i]))
             new_normals.append(Vector(normals[i]))
             continue
-        v_in = Vector(vecs[i - 1])
-        v_out = Vector(vecs[i])
-        l_in = v_in.length
-        l_out = v_out.length
-        d_in = v_in / l_in
-        d_out = v_out / l_out
-        turn = (d_in).angle(d_out, 0.0)
+        corner, d_in, d_out, turn, avail_in, avail_out = geo
         half = turn * 0.5
-        r = radius_factor * min(l_in, l_out)
-        t = r / math.tan(half) if half > 1e-09 else 0.0
-        t = min(t, l_in * 0.49, l_out * 0.49)
-        r_eff = t * math.tan(half)
-        if r_eff <= 1e-09:
-            new_points.append(Vector(points[i]))
-            new_normals.append(Vector(normals[i]))
-            continue
-        corner = Vector(points[i])
-        t1 = corner - d_in * t          # 圆弧起点（进入侧切点）
-        # 圆心位于弯折内侧：内角平分方向 = normalize(d_out - d_in)
-        center_dir = d_out - d_in
-        cl = center_dir.length
-        if cl < 1e-07:
-            new_points.append(Vector(points[i]))
-            new_normals.append(Vector(normals[i]))
-            continue
-        center = corner + (center_dir / cl) * (r_eff / math.sin(half) if math.sin(half) > 1e-09 else 0.0)
+        tan_half = math.tan(half)
+        sin_half = math.sin(half)
+        base_dir = d_out - d_in
         axis = d_in.cross(d_out)
-        al = axis.length
-        if al < 1e-09:
+        # 圆角半径以两侧直线段长度（而非相邻采样点间距）为基准：
+        # 采样点可能恰好落在角点旁，用相邻间距会把圆角钳成几乎为零。
+        room = max(1e-09, min(avail_in, avail_out))
+        draw_radius = radius_factor * room
+        tangent = min(draw_radius * tan_half, room * 0.45)
+        fillet_radius = tangent / tan_half if tan_half > 1e-09 else 0.0
+        if (tan_half <= 1e-09 or sin_half <= 1e-09 or tangent <= 1e-09
+                or fillet_radius <= 1e-09 or base_dir.length <= 1e-07
+                or axis.length <= 1e-09):
             new_points.append(Vector(points[i]))
             new_normals.append(Vector(normals[i]))
             continue
-        axis = axis / al
-        start_rel = t1 - center
+        base_dir.normalize()
+        axis.normalize()
+        # 落在圆角区间内（距角点 < T）的采样点必须移除，否则弧首 / 弧末之外又残留
+        # 更靠近角点的点，路径会倒退、截面自交——正是小半径时拐角破洞的来源。
+        # 弧首之前的点已在上一轮追加，这里回退删除；弧首之后的点用 drop_until 跳过。
+        reach = tangent * 1.0001
+        while len(new_points) > 1 and (new_points[-1] - corner).length <= reach:
+            new_points.pop()
+            new_normals.pop()
+            for key in [k for k in rot_steps if k >= len(new_points)]:
+                del rot_steps[key]
+        # 弧首切点 = corner - d_in·T，弧首末与进入 / 离开段相切；
+        # 圆心在弯折内侧，距角点 T/sin(θ/2)
+        center = corner + base_dir * (tangent / sin_half)
+        start_rel = (corner - d_in * tangent) - center
+        step_angle = turn / arc_segments
+        arc_start = len(new_points)
         for k in range(arc_segments + 1):
-            phi = turn * k / arc_segments
-            rot = Matrix.Rotation(phi, 3, axis)
-            p_k = center + rot @ start_rel
-            new_points.append(Vector(p_k))
-            new_normals.append(Vector(normals[i]))
+            if k > 0:
+                # 第 k 段（到达第 k 个弧点）由放样器绕圆心做刚体旋转
+                rot_steps[len(new_points) - 1] = (center.copy(), axis.copy(), step_angle)
+            new_points.append(center + (Matrix.Rotation(step_angle * k, 3, axis) @ start_rel))
+            new_normals.append(Vector(d_in) if k == 0 else Vector(normals[i]))
+        # 弧起点法向取"进入方向"：保证到达切点的那一步是纯平移投影（零剪切），
+        # 弧内部再由刚体旋转推进（该法向在下方统一重算后回填）
+        arc_start_normals.append((arc_start, d_in.copy()))
+        # 角点之后的采样点：落在圆角区间内的移除；已在弧末之外的停手。
+        # 不能一遇到"区间外"的点就 break——角点前的点本来就在区间外，
+        # 而角点旁（弧内）的点往往排在它后面。
+        # 前后位置必须用角平分线判定：钝角拐角时 d_out 会指回角点后方，
+        # 用 rel·d_out 会把角点前的点误判成"已越过弧末"。
+        bisector = d_in + d_out
+        if bisector.length > 1e-06:
+            bisector.normalize()
+        else:
+            bisector = None
+        drop_until = i - 1
+        for j in range(i, min(n_pts - 1, i + 12)):
+            rel = Vector(points[j]) - corner
+            if rel.length <= reach:
+                drop_until = j
+                continue
+            if bisector is not None and rel.dot(bisector) > reach:
+                break
     new_points.append(Vector(points[-1]))
     new_normals.append(Vector(normals[-1]))
     new_vecs = [new_points[j + 1] - new_points[j] for j in range(len(new_points) - 1)]
-    # 内部法向统一按"相邻弦平分"重算（与基础放样规则一致）：
-    # 保证扫掠投影为纯平移，无剪切累积，左右镜像对称
+    # 3) 内部法向统一按"相邻弦平分"重算（与基础放样规则一致）：
+    #    保证扫掠投影为纯平移，无剪切累积，左右镜像对称
     for idx in range(1, len(new_points) - 1):
         a = new_vecs[idx - 1]
         b = new_vecs[idx]
@@ -1282,76 +1489,52 @@ def _round_path_corners(points, normals, vecs, angle_threshold_rad,
         if avg.length < 1e-07:
             avg = b / lb
         new_normals[idx] = Vector(avg.normalized())
+    for idx, normal_value in arc_start_normals:
+        if 0 < idx < len(new_normals):
+            new_normals[idx] = Vector(normal_value)
     if is_looping and len(new_normals) >= 2:
         new_normals[-1] = Vector(new_normals[0])
-    return new_points, new_normals, new_vecs, None
+    return new_points, new_normals, new_vecs, rot_steps
 
 def _snap_corners_to_intersections(points, vecs, angle_threshold_rad):
     """拐角重建：重采样点几乎不会恰好落在真实拐角上（折线在拐角处是斜切的），
-    导致锐化/圆角的基准点偏离真实拐角、左右不对称。
-    这里用拐角点相邻"直线段"的延长线交点把拐角点校正回真实拐角位置。
-    参考方向优先取更远的相邻段（拐角跨越段的方向被采样斜化，不可靠）。
+    导致锐化斜切的基准点偏离真实拐角、左右不对称。
+    这里用 _corner_geometry 求出的真实拐角交点校正拐角采样点；同一个拐角若同时
+    被相邻两个采样点"看到"，只校正更靠近交点的那一个，避免两点被拉到同一位置
+    而产生零长度段。校正量过大（交点估计不可靠）时保持原样。
     返回 (points, vecs)。"""
     n = len(points)
-    if n < 5 or len(vecs) != n - 1:
+    if n < 3:
         return points, vecs
     try: thr = float(angle_threshold_rad)
     except Exception: thr = math.radians(30.0)
+    if thr <= 1e-09:
+        return points, vecs
     new_points = [Vector(p) for p in points]
     changed = False
+    skip_next = False
     for i in range(1, n - 1):
-        v_in = Vector(vecs[i - 1])
-        v_out = Vector(vecs[i])
-        l_in = v_in.length
-        l_out = v_out.length
-        if l_in <= 1e-09 or l_out <= 1e-09:
+        if skip_next:
+            skip_next = False
             continue
-        d_prev = v_in / l_in
-        d_next = v_out / l_out
-        try: turn = d_prev.angle(d_next, 0.0)
-        except Exception: turn = 0.0
-        if turn < thr or turn <= 1e-06:
+        geo = _is_corner_candidate(points, i, thr)
+        if not geo:
             continue
-        # 参考方向：优先取相邻的更远段（若与近段近似共线，说明是直线延续）
-        ref_lim = min(math.radians(30.0), turn * 0.6)
-        d_in_ref = d_prev
-        if i >= 2:
-            d2 = Vector(vecs[i - 2])
-            if d2.length > 1e-09:
-                d2 = d2 / d2.length
-                try:
-                    if d2.angle(d_prev, 0.0) < ref_lim: d_in_ref = d2
-                except Exception: pass
-        d_out_ref = d_next
-        if i <= n - 3:
-            d2 = Vector(vecs[i + 1])
-            if d2.length > 1e-09:
-                d2 = d2 / d2.length
-                try:
-                    if d2.angle(d_next, 0.0) < ref_lim: d_out_ref = d2
-                except Exception: pass
-        try:
-            ref_turn = d_in_ref.angle(d_out_ref, 0.0)
-        except Exception:
-            continue
-        if ref_turn < thr or ref_turn >= math.pi - 1e-06:
-            continue
-        p_a = Vector(points[i - 1])
-        p_b = Vector(points[i + 1])
-        far = (l_in + l_out) * 10.0 + 1.0
-        try:
-            hits = mathutils.geometry.intersect_line_line(
-                p_a, p_a + d_in_ref * far, p_b - d_out_ref * far, p_b)
-        except Exception:
-            hits = None
-        if not hits:
-            continue
-        x_pt = (Vector(hits[0]) + Vector(hits[1])) * 0.5
-        # 合理性：交点不能偏离原拐角点太远
-        if (x_pt - Vector(points[i])).length > (l_in + l_out) * 1.5 + 1e-06:
-            continue
-        new_points[i] = x_pt
-        changed = True
+        corner, _d_in, _d_out, _turn = geo[0], geo[1], geo[2], geo[3]
+        l_in = (corner - Vector(points[i - 1])).length
+        l_out = (Vector(points[i + 1]) - corner).length
+        shift = (corner - Vector(points[i])).length
+        if shift > max(1e-06, min(l_in, l_out) * 0.5):
+            continue  # 交点离采样点太远，判断为不可靠，保持原样
+        if i + 1 < n - 1:
+            geo_next = _is_corner_candidate(points, i + 1, thr)
+            if geo_next:
+                if (geo_next[0] - Vector(points[i + 1])).length < shift:
+                    continue  # 交给下一个采样点处理，它离交点更近
+                skip_next = True
+        if shift > 1e-09:
+            new_points[i] = corner
+            changed = True
     if not changed:
         return points, vecs
     new_vecs = [new_points[j + 1] - new_points[j] for j in range(len(new_points) - 1)]
@@ -1360,16 +1543,15 @@ def _snap_corners_to_intersections(points, vecs, angle_threshold_rad):
 def _apply_corner_treatment(points, normals, vecs, angle_threshold_rad=math.radians(30.0),
                            extra_segments=0, do_miter=True, radius_factor=0.35, is_looping=False):
     """拐角处理总入口：
-    1) 拐角重建：把偏离真实拐角的采样点校正到直线段延长线交点上
-    2) 拐角分段 > 0：拐角变为圆弧过渡（分段数即圆弧精度）
-    3) 拐角分段 = 0 且开启锐化：拐角为对称旋转斜切锐边
+    1) 拐角分段 > 0：拐角替换为相切圆弧（分段数即圆弧精度），弧上以刚体旋转推进
+    2) 拐角分段 = 0 且开启锐化：先把拐角采样点校正到真实拐角，再做对称斜切
     返回 (points, normals, vecs, rot_steps)"""
-    points, vecs = _snap_corners_to_intersections(points, vecs, angle_threshold_rad)
     if extra_segments and int(extra_segments or 0) > 0:
         return _round_path_corners(
             points, normals, vecs, angle_threshold_rad,
             int(extra_segments or 0), radius_factor, is_looping)
     if do_miter:
+        points, vecs = _snap_corners_to_intersections(points, vecs, angle_threshold_rad)
         return _sharpen_corners(points, normals, vecs, angle_threshold_rad, is_looping)
     return points, normals, vecs, None
 
@@ -3213,18 +3395,17 @@ class MESH_OT_punten_naar_mesh(bpy.types.Operator):
             punten = get_selected_verts()
             rot_info = corner_rot_steps.get(t) if corner_rot_steps else None
             if rot_info:
-                # 拐角旋转步：绕拐角轴做刚体旋转（对称斜切，无剪切无缺口）
+                # 拐角圆弧步：绕圆心做刚体旋转（截面不变形、不剪切、无缺口）
                 try:
                     rot_origin = Vector(rot_info[0])
                     rot_axis = Vector(rot_info[1])
                     rot_ang = float(rot_info[2])
                     rot_mat = Matrix.Rotation(rot_ang, 4, rot_axis)
                     rot_final = Matrix.Translation(rot_origin) @ rot_mat @ Matrix.Translation(-rot_origin)
-                    bm.verts.ensure_lookup_table()
-                    for elm in punten:
-                        bm.verts[elm[0].index].co = rot_final @ bm.verts[elm[0].index].co
-                except Exception:
-                    pass
+                    for v in punten:
+                        v.co = rot_final @ v.co
+                except Exception as e:
+                    print(f'拐角圆弧旋转失败: {e}')
             else:
                 rv = seg_vecs[t]
                 vp = points_list[t + 1]
@@ -3282,9 +3463,14 @@ class MESH_OT_punten_naar_mesh(bpy.types.Operator):
 
         if not is_loop_calc:
             bm.select_flush(True)
-        # 清理拐角旋转步产生的退化几何（零长度边/零面积面）
+        # 清理投影斜切可能留下的退化几何（零长度边 / 零面积面）。
+        # 阈值按路径总长缩放：分段数很大时圆角弦长会很小，固定 1e-5 会把圆弧也吃掉
         try:
-            bmesh.ops.dissolve_degenerate(bm, dist=1e-5, edges=list(bm.edges))
+            path_len = 0.0
+            for rv in seg_vecs:
+                path_len += rv.length
+            purge_dist = min(1e-05, max(1e-09, path_len * 1e-07))
+            bmesh.ops.dissolve_degenerate(bm, dist=purge_dist, edges=list(bm.edges))
         except Exception:
             pass
         bmesh.update_edit_mesh(me)
@@ -3506,7 +3692,8 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
     bl_label = 'Path Follow'
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_options = {'DEFAULT_CLOSED'}
+    # 默认展开：不加 'DEFAULT_CLOSED'，勾选面板后直接显示全部控件
+    bl_options = set()
 
     def draw_header(self, context):
         # 面板右上角：仅图标的语言切换按钮
@@ -3712,12 +3899,12 @@ def register():
         default=math.radians(30.0), min=math.radians(5.0), max=math.radians(89.0),
         subtype='ANGLE', update=update_gen_mesh)
     bpy.types.Scene.rail_corner_segments = bpy.props.IntProperty(
-        name='Corner Segments', default=0, min=0, max=24,
+        name='Corner Segments', default=0, min=0, max=10000,
         description='拐角圆弧的分段数：大于 0 时拐角生成圆弧过渡 / Arc resolution for rounded corners; 0 = off',
         update=update_gen_mesh)
     bpy.types.Scene.rail_corner_radius = bpy.props.FloatProperty(
         name='Corner Radius', default=0.35, min=0.05, max=0.45, subtype='FACTOR',
-        description='圆角半径占较短邻段长度的比例 / Fillet radius as a fraction of the shorter adjacent segment',
+        description='圆角半径占拐角两侧直线段中较短一侧的比例（与采样密度无关）/ Fillet radius as a fraction of the shorter straight run at the corner (independent of sampling density)',
         update=update_gen_mesh)
     bpy.types.Scene.rail_map_start = bpy.props.FloatProperty(
         name='Mapping Start', description='控制截面从路径长度的哪个百分比位置开始生成',
