@@ -167,7 +167,7 @@ mesh.select_rail / mesh.select_profile	选中关联路径 / 截面
 mesh.apply_rail_follow	应用（断开关联）
 📄 版本
 
-    1.2 — 当前版本
+    1.1 — 当前版本
 
         拐角锐化 / 圆角 / 角度阈值
 
