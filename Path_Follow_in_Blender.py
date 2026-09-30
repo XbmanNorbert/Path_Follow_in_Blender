@@ -10,7 +10,7 @@ bl_info = {
     'author': 'Xbman',
     'description': '选中路径和截面，路径为活动物体，选中后执行放样',
     'blender': (2, 80, 0),
-    'version': (1, 0, 1),
+    'version': (1, 0, 2),
     'location': '3D视图 > 侧边栏 > 路径跟随标签页',
     'category': '网格',
 }
@@ -196,7 +196,8 @@ def rail_redo_post(*_args):
 # 运行时场景属性缓存
 # ═══════════════════════════════════════════════════════════
 _RUNTIME_SCENE_KEYS = {'punten_lijst', 'loc_oorsprong', 'start_tangent',
-                       'richt_lijnen', 'norm_lijst', 'is_loop_calc', 'eindig'}
+                       'richt_lijnen', 'norm_lijst', 'is_loop_calc', 'eindig',
+                       'corner_rot_steps'}
 _SCENE_RUNTIME_CACHE = {}
 
 def _runtime_scene_id(scene):
@@ -261,6 +262,8 @@ _GEN_SETTINGS_DEFAULTS = {
     'flip_dir': True, 'cap_start': True, 'cap_end': True,
     'make_loop': False, 'flatten_start': False, 'flatten_end': False,
     'map_start': 0.0, 'map_end': 1.0,
+    'corner_sharp': True, 'corner_angle': 30.0, 'corner_segments': 0,
+    'corner_radius': 0.35,
 }
 
 def _coerce_gen_settings(raw=None):
@@ -298,6 +301,11 @@ def _current_gen_settings_from_scene(scene):
         'flatten_end': scene.get('rail_flatten_end', False),
         'map_start': _scene_float_prop(scene, 'rail_map_start', 0.0),
         'map_end': _scene_float_prop(scene, 'rail_map_end', 1.0),
+        'corner_sharp': bool(getattr(scene, 'rail_corner_sharp', True)),
+        'corner_angle': round(math.degrees(_scene_float_prop(
+            scene, 'rail_corner_angle', math.radians(30.0))), 2),
+        'corner_segments': int(getattr(scene, 'rail_corner_segments', 0) or 0),
+        'corner_radius': _scene_float_prop(scene, 'rail_corner_radius', 0.35),
     })
 
 def _has_gen_settings(obj):
@@ -721,7 +729,11 @@ def set_resolution_proxy(self, value):
             if obj.get('gen_rail_name') == rail.name:
                 has_linked_gen = True; break
         if has_linked_gen:
-            trigger_auto_update_delayed(bpy.context, delay=0.01)
+            # 实时更新开启时，修改器变化本身会经依赖图处理器排一次重建，
+            # 这里再排一次会导致每次改数值都重建两遍（表现为模型抖动/抽搐）
+            auto_handled = bool(getattr(scene, 'rail_auto_update', False))
+            if not auto_handled:
+                trigger_auto_update_delayed(bpy.context, delay=0.01)
 
 # ═══════════════════════════════════════════════════════════
 # 核心自动更新
@@ -788,8 +800,21 @@ def run_update_operator():
                 scene['rail_cap_start'] = sett.get('cap_start', True)
                 scene['rail_cap_end'] = sett.get('cap_end', True)
                 scene['rail_make_loop'] = sett.get('make_loop', False)
-                scene['rail_flatten_start'] = sett.get('flatten_start', False)
-                scene['rail_flatten_end'] = sett.get('flatten_end', False)
+                try: scene.rail_flatten_start = bool(sett.get('flatten_start', False))
+                except Exception: pass
+                try: scene.rail_flatten_end = bool(sett.get('flatten_end', False))
+                except Exception: pass
+                try: scene.rail_corner_sharp = bool(sett.get('corner_sharp', True))
+                except Exception: pass
+                try:
+                    scene.rail_corner_angle = math.radians(
+                        float(sett.get('corner_angle', 30.0)))
+                except Exception:
+                    pass
+                try: scene.rail_corner_segments = int(sett.get('corner_segments', 0) or 0)
+                except Exception: pass
+                try: scene.rail_corner_radius = float(sett.get('corner_radius', 0.35))
+                except Exception: pass
                 _set_scene_mapping_no_update(
                     scene,
                     sett.get('map_start', _scene_float_prop(scene, 'rail_map_start', 0.0)),
@@ -1128,6 +1153,226 @@ def _calc_open_path_normals(points):
     normals.append(segs[-1].normalized())
     return clean_points, normals
 
+def _sharpen_corners(points, normals, vecs, angle_threshold_rad, is_looping=False):
+    """拐角锐化：拐角重建（snap 已在上游完成）后，拐角处使用平分斜接
+    （标准弯头，左右对称、水密无缺口）。此函数只需透传，
+    因为对称性由"弦平分法向 + 纯平移投影"机制保证。
+    返回 (points, normals, vecs, None)。"""
+    return points, normals, vecs, None
+
+def _round_path_corners(points, normals, vecs, angle_threshold_rad,
+                        arc_segments, radius_factor=0.35, is_looping=False):
+    """拐角圆角：把尖角替换为一段圆弧（圆角/倒角）。
+    arc_segments 为圆弧分段数，radius_factor 为圆角半径占较短邻段长度的比例。
+    只处理转角局部峰值点，且圆角之间保持最小间距，避免连续多点各自触发
+    圆角导致弧段堆叠（扇形堆积）。
+    返回 (points, normals, vecs, None)。"""
+    try: arc_segments = int(arc_segments)
+    except Exception: return points, normals, vecs, None
+    try: radius_factor = float(radius_factor)
+    except Exception: radius_factor = 0.35
+    if arc_segments <= 0:
+        return points, normals, vecs, None
+    n_pts = len(points)
+    if n_pts < 3 or len(vecs) < 2 or len(normals) != n_pts:
+        return points, normals, vecs, None
+    try: thr = float(angle_threshold_rad)
+    except Exception: thr = math.radians(30.0)
+    radius_factor = max(0.02, min(0.45, radius_factor))
+    # 1) 计算每个内部点的转角
+    turns = []
+    for i in range(1, n_pts - 1):
+        v_in = Vector(vecs[i - 1])
+        v_out = Vector(vecs[i])
+        l_in = v_in.length
+        l_out = v_out.length
+        t = -1.0
+        if l_in > 1e-09 and l_out > 1e-09:
+            try: t = (v_in / l_in).angle(v_out / l_out, 0.0)
+            except Exception: t = -1.0
+        turns.append(t)
+    # 2) 选出拐角点：局部峰值 + 最小间距（避免相邻多点连续触发）。
+    #    圆角切点最多吃掉邻段的 49%，因此相距 >=2 的拐角不会重叠，
+    #    间距只需 2（防止紧邻两点重复触发）。
+    corner_indices = []
+    handled_until = -1
+    min_gap = 2
+    for idx, i in enumerate(range(1, n_pts - 1)):
+        if i <= handled_until:
+            continue
+        t = turns[idx]
+        if t < thr or t <= 1e-06 or t >= math.pi - 1e-06:
+            continue
+        t_prev = turns[idx - 1] if idx > 0 else -1.0
+        t_next = turns[idx + 1] if idx + 1 < len(turns) else -1.0
+        if t < t_prev or t < t_next:
+            continue  # 不是局部峰值，交给邻近峰值点处理
+        corner_indices.append(i)
+        handled_until = i + min_gap
+    if not corner_indices:
+        return points, normals, vecs, None
+    corner_set = set(corner_indices)
+    # 3) 生成圆弧
+    new_points = [Vector(points[0])]
+    new_normals = [Vector(normals[0])]
+    for i in range(1, n_pts - 1):
+        if i not in corner_set:
+            new_points.append(Vector(points[i]))
+            new_normals.append(Vector(normals[i]))
+            continue
+        v_in = Vector(vecs[i - 1])
+        v_out = Vector(vecs[i])
+        l_in = v_in.length
+        l_out = v_out.length
+        d_in = v_in / l_in
+        d_out = v_out / l_out
+        turn = (d_in).angle(d_out, 0.0)
+        half = turn * 0.5
+        r = radius_factor * min(l_in, l_out)
+        t = r / math.tan(half) if half > 1e-09 else 0.0
+        t = min(t, l_in * 0.49, l_out * 0.49)
+        r_eff = t * math.tan(half)
+        if r_eff <= 1e-09:
+            new_points.append(Vector(points[i]))
+            new_normals.append(Vector(normals[i]))
+            continue
+        corner = Vector(points[i])
+        t1 = corner - d_in * t          # 圆弧起点（进入侧切点）
+        # 圆心位于弯折内侧：内角平分方向 = normalize(d_out - d_in)
+        center_dir = d_out - d_in
+        cl = center_dir.length
+        if cl < 1e-07:
+            new_points.append(Vector(points[i]))
+            new_normals.append(Vector(normals[i]))
+            continue
+        center = corner + (center_dir / cl) * (r_eff / math.sin(half) if math.sin(half) > 1e-09 else 0.0)
+        axis = d_in.cross(d_out)
+        al = axis.length
+        if al < 1e-09:
+            new_points.append(Vector(points[i]))
+            new_normals.append(Vector(normals[i]))
+            continue
+        axis = axis / al
+        start_rel = t1 - center
+        for k in range(arc_segments + 1):
+            phi = turn * k / arc_segments
+            rot = Matrix.Rotation(phi, 3, axis)
+            p_k = center + rot @ start_rel
+            new_points.append(Vector(p_k))
+            new_normals.append(Vector(normals[i]))
+    new_points.append(Vector(points[-1]))
+    new_normals.append(Vector(normals[-1]))
+    new_vecs = [new_points[j + 1] - new_points[j] for j in range(len(new_points) - 1)]
+    # 内部法向统一按"相邻弦平分"重算（与基础放样规则一致）：
+    # 保证扫掠投影为纯平移，无剪切累积，左右镜像对称
+    for idx in range(1, len(new_points) - 1):
+        a = new_vecs[idx - 1]
+        b = new_vecs[idx]
+        la = a.length
+        lb = b.length
+        if la <= 1e-09 and lb <= 1e-09:
+            continue
+        if la <= 1e-09:
+            new_normals[idx] = Vector(b / lb)
+            continue
+        if lb <= 1e-09:
+            new_normals[idx] = Vector(a / la)
+            continue
+        avg = (a / la) + (b / lb)
+        if avg.length < 1e-07:
+            avg = b / lb
+        new_normals[idx] = Vector(avg.normalized())
+    if is_looping and len(new_normals) >= 2:
+        new_normals[-1] = Vector(new_normals[0])
+    return new_points, new_normals, new_vecs, None
+
+def _snap_corners_to_intersections(points, vecs, angle_threshold_rad):
+    """拐角重建：重采样点几乎不会恰好落在真实拐角上（折线在拐角处是斜切的），
+    导致锐化/圆角的基准点偏离真实拐角、左右不对称。
+    这里用拐角点相邻"直线段"的延长线交点把拐角点校正回真实拐角位置。
+    参考方向优先取更远的相邻段（拐角跨越段的方向被采样斜化，不可靠）。
+    返回 (points, vecs)。"""
+    n = len(points)
+    if n < 5 or len(vecs) != n - 1:
+        return points, vecs
+    try: thr = float(angle_threshold_rad)
+    except Exception: thr = math.radians(30.0)
+    new_points = [Vector(p) for p in points]
+    changed = False
+    for i in range(1, n - 1):
+        v_in = Vector(vecs[i - 1])
+        v_out = Vector(vecs[i])
+        l_in = v_in.length
+        l_out = v_out.length
+        if l_in <= 1e-09 or l_out <= 1e-09:
+            continue
+        d_prev = v_in / l_in
+        d_next = v_out / l_out
+        try: turn = d_prev.angle(d_next, 0.0)
+        except Exception: turn = 0.0
+        if turn < thr or turn <= 1e-06:
+            continue
+        # 参考方向：优先取相邻的更远段（若与近段近似共线，说明是直线延续）
+        ref_lim = min(math.radians(30.0), turn * 0.6)
+        d_in_ref = d_prev
+        if i >= 2:
+            d2 = Vector(vecs[i - 2])
+            if d2.length > 1e-09:
+                d2 = d2 / d2.length
+                try:
+                    if d2.angle(d_prev, 0.0) < ref_lim: d_in_ref = d2
+                except Exception: pass
+        d_out_ref = d_next
+        if i <= n - 3:
+            d2 = Vector(vecs[i + 1])
+            if d2.length > 1e-09:
+                d2 = d2 / d2.length
+                try:
+                    if d2.angle(d_next, 0.0) < ref_lim: d_out_ref = d2
+                except Exception: pass
+        try:
+            ref_turn = d_in_ref.angle(d_out_ref, 0.0)
+        except Exception:
+            continue
+        if ref_turn < thr or ref_turn >= math.pi - 1e-06:
+            continue
+        p_a = Vector(points[i - 1])
+        p_b = Vector(points[i + 1])
+        far = (l_in + l_out) * 10.0 + 1.0
+        try:
+            hits = mathutils.geometry.intersect_line_line(
+                p_a, p_a + d_in_ref * far, p_b - d_out_ref * far, p_b)
+        except Exception:
+            hits = None
+        if not hits:
+            continue
+        x_pt = (Vector(hits[0]) + Vector(hits[1])) * 0.5
+        # 合理性：交点不能偏离原拐角点太远
+        if (x_pt - Vector(points[i])).length > (l_in + l_out) * 1.5 + 1e-06:
+            continue
+        new_points[i] = x_pt
+        changed = True
+    if not changed:
+        return points, vecs
+    new_vecs = [new_points[j + 1] - new_points[j] for j in range(len(new_points) - 1)]
+    return new_points, new_vecs
+
+def _apply_corner_treatment(points, normals, vecs, angle_threshold_rad=math.radians(30.0),
+                           extra_segments=0, do_miter=True, radius_factor=0.35, is_looping=False):
+    """拐角处理总入口：
+    1) 拐角重建：把偏离真实拐角的采样点校正到直线段延长线交点上
+    2) 拐角分段 > 0：拐角变为圆弧过渡（分段数即圆弧精度）
+    3) 拐角分段 = 0 且开启锐化：拐角为对称旋转斜切锐边
+    返回 (points, normals, vecs, rot_steps)"""
+    points, vecs = _snap_corners_to_intersections(points, vecs, angle_threshold_rad)
+    if extra_segments and int(extra_segments or 0) > 0:
+        return _round_path_corners(
+            points, normals, vecs, angle_threshold_rad,
+            int(extra_segments or 0), radius_factor, is_looping)
+    if do_miter:
+        return _sharpen_corners(points, normals, vecs, angle_threshold_rad, is_looping)
+    return points, normals, vecs, None
+
 def _estimate_profile_mapping_safe_distance(profile_obj):
     if not profile_obj or getattr(profile_obj, 'type', None) != 'MESH': return 0.0
     try:
@@ -1243,8 +1488,8 @@ def _apply_path_mapping_to_scene(scene, profile_obj=None):
     mapped_vecs = [mapped_points[i + 1] - mapped_points[i] for i in range(len(mapped_points) - 1)]
     if not mapped_vecs: return False
     try:
-        flatten_start = bool(scene.get('rail_flatten_start', False))
-        flatten_end = bool(scene.get('rail_flatten_end', False))
+        flatten_start = bool(getattr(scene, 'rail_flatten_start', False))
+        flatten_end = bool(getattr(scene, 'rail_flatten_end', False))
 
         def get_snapped_normal(tangent_vec):
             x, y, z = abs(tangent_vec.x), abs(tangent_vec.y), abs(tangent_vec.z)
@@ -1259,6 +1504,19 @@ def _apply_path_mapping_to_scene(scene, profile_obj=None):
         if flatten_end and len(mapped_vecs) >= 1:
             mapped_normals[-1] = get_snapped_normal(mapped_vecs[-1].normalized())
     except Exception: pass
+    mapped_rot_steps = None
+    if getattr(scene, 'rail_corner_sharp', True) or int(getattr(scene, 'rail_corner_segments', 0) or 0) > 0:
+        try:
+            mapped_points, mapped_normals, mapped_vecs, mapped_rot_steps = _apply_corner_treatment(
+                mapped_points, mapped_normals, mapped_vecs,
+                _scene_float_prop(scene, 'rail_corner_angle', math.radians(30.0)),
+                int(getattr(scene, 'rail_corner_segments', 0) or 0),
+                bool(getattr(scene, 'rail_corner_sharp', True)),
+                _scene_float_prop(scene, 'rail_corner_radius', 0.35),
+                False)
+        except Exception:
+            mapped_rot_steps = None
+    _set_runtime_scene_prop(scene, 'corner_rot_steps', mapped_rot_steps)
     _set_runtime_scene_prop(scene, 'punten_lijst', mapped_points)
     _set_runtime_scene_prop(scene, 'norm_lijst', mapped_normals)
     _set_runtime_scene_prop(scene, 'richt_lijnen', mapped_vecs)
@@ -1326,6 +1584,11 @@ def apply_resample_modifier(obj, resolution_count):
     mod.node_group = node_group
     try:
         identifier = _get_modifier_identifier(mod, 'Count')
+        # 数值未变化时不写入：写一次会标记依赖图，导致"重建→再触发重建"的抖动回环
+        if identifier:
+            current = get_modifier_input_value(mod, identifier)
+            if current is not None and int(current) == int(resolution_count):
+                return
         updated = False
         if identifier and set_modifier_input_value(mod, identifier, resolution_count):
             updated = True
@@ -1823,6 +2086,20 @@ class MESH_OT_puntenlijst(bpy.types.Operator):
                 t_end = (coords[-1] - coords[-2]).normalized()
                 normals[-1] = get_snapped_normal(t_end)
 
+        rot_steps = None
+        if getattr(scene, 'rail_corner_sharp', True) or int(getattr(scene, 'rail_corner_segments', 0) or 0) > 0:
+            try:
+                coords, normals, vecs, rot_steps = _apply_corner_treatment(
+                    coords, normals, vecs,
+                    _scene_float_prop(scene, 'rail_corner_angle', math.radians(30.0)),
+                    int(getattr(scene, 'rail_corner_segments', 0) or 0),
+                    bool(getattr(scene, 'rail_corner_sharp', True)),
+                    _scene_float_prop(scene, 'rail_corner_radius', 0.35),
+                    is_looping)
+            except Exception:
+                rot_steps = None
+
+        _set_runtime_scene_prop(bpy.context.scene, 'corner_rot_steps', rot_steps)
         _set_runtime_scene_prop(bpy.context.scene, 'loc_oorsprong',
                                 Vector((0, 0, 0)) if use_world_space else ob.location)
         _set_runtime_scene_prop(bpy.context.scene, 'punten_lijst', coords)
@@ -2913,6 +3190,10 @@ class MESH_OT_punten_naar_mesh(bpy.types.Operator):
             eindig = _get_runtime_scene_prop(bpy.context.scene, 'eindig', True)
         except Exception:
             return {'CANCELLED'}
+        try:
+            corner_rot_steps = _get_runtime_scene_prop(bpy.context.scene, 'corner_rot_steps', None) or {}
+        except Exception:
+            corner_rot_steps = {}
 
         track_up = Vector((0, 0, 1))
 
@@ -2930,12 +3211,27 @@ class MESH_OT_punten_naar_mesh(bpy.types.Operator):
         for t in range(num_steps):
             _rail_op(bpy.ops.mesh.extrude_context)
             punten = get_selected_verts()
-            rv = seg_vecs[t]
-            vp = points_list[t + 1]
-            vn = bisector_normals[t + 1]
-            verplaatsen(punt_snijpunt(punten, rv, vp, vn))
-            if is_z_up_mode:
-                track_up = correct_twist(punten, vp, vn, track_up)
+            rot_info = corner_rot_steps.get(t) if corner_rot_steps else None
+            if rot_info:
+                # 拐角旋转步：绕拐角轴做刚体旋转（对称斜切，无剪切无缺口）
+                try:
+                    rot_origin = Vector(rot_info[0])
+                    rot_axis = Vector(rot_info[1])
+                    rot_ang = float(rot_info[2])
+                    rot_mat = Matrix.Rotation(rot_ang, 4, rot_axis)
+                    rot_final = Matrix.Translation(rot_origin) @ rot_mat @ Matrix.Translation(-rot_origin)
+                    bm.verts.ensure_lookup_table()
+                    for elm in punten:
+                        bm.verts[elm[0].index].co = rot_final @ bm.verts[elm[0].index].co
+                except Exception:
+                    pass
+            else:
+                rv = seg_vecs[t]
+                vp = points_list[t + 1]
+                vn = bisector_normals[t + 1]
+                verplaatsen(punt_snijpunt(punten, rv, vp, vn))
+                if is_z_up_mode:
+                    track_up = correct_twist(punten, vp, vn, track_up)
             last_step_verts = punten
 
         if is_loop_calc:
@@ -2986,6 +3282,11 @@ class MESH_OT_punten_naar_mesh(bpy.types.Operator):
 
         if not is_loop_calc:
             bm.select_flush(True)
+        # 清理拐角旋转步产生的退化几何（零长度边/零面积面）
+        try:
+            bmesh.ops.dissolve_degenerate(bm, dist=1e-5, edges=list(bm.edges))
+        except Exception:
+            pass
         bmesh.update_edit_mesh(me)
         if is_loop_calc:
             _rail_op(bpy.ops.mesh.normals_make_consistent, inside=False)
@@ -3097,6 +3398,107 @@ def draw_direction_arrow():
 _draw_handler = None
 
 # ═══════════════════════════════════════════════════════════
+# 界面语言（中文 / English）
+# ═══════════════════════════════════════════════════════════
+_UI_TEXTS = {
+    'zh': {
+        'lang': '界面语言',
+        'select_rail': '选中路径', 'select_profile': '选中截面',
+        'apply_final': '应用物体（不再实时更新）',
+        'segments': '分段', 'auto_update': '实时更新',
+        'mirror_x': 'X轴镜像', 'mirror_y': 'Y轴镜像',
+        'reverse_path': '⇄ 切换路径首尾', 'keep_z_up': '⬆ 保持Z轴向上',
+        'mapping': '路径映射', 'map_start': '开始映射', 'map_end': '结束映射',
+        'map_reset': '重置映射',
+        'cap_start': '起始封口', 'cap_end': '结束封口',
+        'squared_start': '起始正交', 'squared_end': '结束正交',
+        'closed_path': '闭合路径', 'snap_profile': '截面吸附到路径',
+        'corner_sharp': '拐角锐化', 'corner_angle': '角度',
+        'corner_segments': '拐角分段', 'corner_radius': '圆角半径',
+        'generate': '执行路径跟随', 'update_btn': '路径跟随',
+    },
+    'en': {
+        'lang': 'Interface Language',
+        'select_rail': 'Select Rail', 'select_profile': 'Select Profile',
+        'apply_final': 'Apply Final Object',
+        'segments': 'Segments', 'auto_update': 'Live Update',
+        'mirror_x': 'Mirror X', 'mirror_y': 'Mirror Y',
+        'reverse_path': '⇄ Reverse Path', 'keep_z_up': '⬆ Keep Z Up',
+        'mapping': 'Path Mapping', 'map_start': 'Start', 'map_end': 'End',
+        'map_reset': 'Reset Mapping',
+        'cap_start': 'Cap Start', 'cap_end': 'Cap End',
+        'squared_start': 'Square Start', 'squared_end': 'Square End',
+        'closed_path': 'Closed Path', 'snap_profile': 'Snap Profile to Path',
+        'corner_sharp': 'Sharp Corners', 'corner_angle': 'Angle',
+        'corner_segments': 'Corner Segments', 'corner_radius': 'Radius',
+        'generate': 'Generate Path Follow', 'update_btn': 'Update Path Follow',
+    },
+}
+
+def _ui_preferences():
+    try:
+        import bpy as _bpy
+        for key in (globals().get('__name__'), 'Path_Follow_in_Blender'):
+            if not key: continue
+            try: return _bpy.context.preferences.addons[key].preferences
+            except Exception: continue
+    except Exception:
+        pass
+    return None
+
+def _ui_lang():
+    prefs = _ui_preferences()
+    if prefs is not None:
+        try: return str(getattr(prefs, 'language', 'zh') or 'zh')
+        except Exception: return 'zh'
+    return 'zh'
+
+def _t(key):
+    lang = 'en' if _ui_lang() == 'en' else 'zh'
+    try:
+        return _UI_TEXTS[lang].get(key) or _UI_TEXTS['zh'].get(key) or key
+    except Exception:
+        return key
+
+class PathFollowPreferences(bpy.types.AddonPreferences):
+    bl_idname = 'Path_Follow_in_Blender'
+
+    language: bpy.props.EnumProperty(
+        name='Language / 界面语言',
+        description='选择面板界面语言 / Choose UI language for the panel',
+        items=[('zh', '中文 (Chinese)', '使用中文界面'),
+               ('en', 'English', 'Use English interface')],
+        default='zh')
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row(align=True)
+        row.label(text='Language / 界面语言')
+        row.prop(self, 'language', expand=True)
+
+class PATHFOLLOW_OT_toggle_language(bpy.types.Operator):
+    bl_idname = 'pathfollow.toggle_language'
+    bl_label = '切换语言 / Toggle Language'
+    bl_description = '切换面板界面语言 / Switch panel UI language'
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return _ui_preferences() is not None
+
+    def execute(self, context):
+        prefs = _ui_preferences()
+        if prefs is None:
+            return {'CANCELLED'}
+        try:
+            prefs.language = 'en' if _ui_lang() == 'zh' else 'zh'
+        except Exception:
+            return {'CANCELLED'}
+        try: _apply_operator_labels()
+        except Exception: pass
+        return {'FINISHED'}
+
+# ═══════════════════════════════════════════════════════════
 # 侧边栏 UI
 # ═══════════════════════════════════════════════════════════
 class VIEW_PT_etrude_mesh(bpy.types.Panel):
@@ -3105,6 +3507,15 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        # 面板右上角：仅图标的语言切换按钮
+        try:
+            if _ui_preferences() is not None:
+                self.layout.operator('pathfollow.toggle_language',
+                                     text='', icon='WORLD')
+        except Exception:
+            pass
 
     def draw(self, context):
         try: _sync_mapping_panel_to_active(context)
@@ -3118,11 +3529,11 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
             box_sel = layout.box()
             col = box_sel.column(align=True)
             row = col.row(align=True)
-            row.operator('mesh.select_rail', text='选中路径', icon='CURVE_DATA')
-            row.operator('mesh.select_profile', text='选中截面', icon='MESH_DATA')
+            row.operator('mesh.select_rail', text=_t('select_rail'), icon='CURVE_DATA')
+            row.operator('mesh.select_profile', text=_t('select_profile'), icon='MESH_DATA')
             row = col.row(align=True)
             row.scale_y = 1.3
-            row.operator('mesh.apply_rail_follow', text='应用物体（不再实时更新）', icon='CHECKMARK')
+            row.operator('mesh.apply_rail_follow', text=_t('apply_final'), icon='CHECKMARK')
 
         target_rail_ob = find_active_rail(context)
         if not target_rail_ob and scene.get('pre_last_rail'):
@@ -3133,7 +3544,7 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
             icon_style = 'LINKED' if is_generated else 'CURVE_DATA'
             split = row.split(factor=0.6)
             split.label(text=f'{target_rail_ob.name}', icon=icon_style)
-            split.prop(scene, 'rail_gen_resolution', text='分段')
+            split.prop(scene, 'rail_gen_resolution', text=_t('segments'))
 
         box_ops = layout.box()
         col = box_ops.column(align=True)
@@ -3151,60 +3562,69 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
         row.operator('mesh.profiel_vlak', text='↘').align_pos = 'BR'
         col.separator()
         row = col.row()
-        row.prop(scene, 'rail_auto_update', text='实时更新', icon='PLAY')
+        row.prop(scene, 'rail_auto_update', text=_t('auto_update'), icon='PLAY')
         col.separator()
         row = col.row(align=True)
         is_mx = context.scene.get('rail_mirror_x', False)
-        row.operator('mesh.spiegel_profiel', text='X轴镜像',
+        row.operator('mesh.spiegel_profiel', text=_t('mirror_x'),
                      icon='CHECKBOX_HLT' if is_mx else 'CHECKBOX_DEHLT').axis = 'X'
         is_my = context.scene.get('rail_mirror_y', False)
-        row.operator('mesh.spiegel_profiel', text='Y轴镜像',
+        row.operator('mesh.spiegel_profiel', text=_t('mirror_y'),
                      icon='CHECKBOX_HLT' if is_my else 'CHECKBOX_DEHLT').axis = 'Y'
         row = col.row(align=True)
         row.operator('mesh.rotate_profile_step', text='⟲ 90°').direction = 'CCW'
         row.operator('mesh.rotate_profile_step', text='90° ⟳').direction = 'CW'
         row = col.row(align=True)
         row.scale_y = 1.2
-        row.operator('mesh.wissel_richting', text='⇄ 切换路径首尾', icon='FILE_REFRESH')
+        row.operator('mesh.wissel_richting', text=_t('reverse_path'), icon='FILE_REFRESH')
         row = col.row(align=True)
         row.scale_y = 1.2
         is_z = context.scene.get('rail_z_up', False)
-        row.operator('mesh.toggle_z_up', text='⬆ 保持Z轴向上',
+        row.operator('mesh.toggle_z_up', text=_t('keep_z_up'),
                      icon='CHECKBOX_HLT' if is_z else 'CHECKBOX_DEHLT')
         col.separator()
         map_box = col.box()
         map_col = map_box.column(align=True)
-        map_col.label(text='路径映射')
+        map_col.label(text=_t('mapping'))
         row = map_col.row(align=True)
-        row.prop(scene, 'rail_map_start', text='开始映射', slider=True)
+        row.prop(scene, 'rail_map_start', text=_t('map_start'), slider=True)
         row = map_col.row(align=True)
-        row.prop(scene, 'rail_map_end', text='结束映射', slider=True)
+        row.prop(scene, 'rail_map_end', text=_t('map_end'), slider=True)
         row = map_col.row(align=True)
-        row.operator('mesh.reset_path_mapping', text='重置映射', icon='FILE_REFRESH')
+        row.operator('mesh.reset_path_mapping', text=_t('map_reset'), icon='FILE_REFRESH')
         layout.separator()
         col = layout.column(align=True)
         row = col.row(align=True)
-        row.prop(scene, 'rail_cap_start', text='起始封口', toggle=True)
-        row.prop(scene, 'rail_cap_end', text='结束封口', toggle=True)
+        row.prop(scene, 'rail_cap_start', text=_t('cap_start'), toggle=True)
+        row.prop(scene, 'rail_cap_end', text=_t('cap_end'), toggle=True)
         row = col.row(align=True)
-        row.prop(scene, 'rail_flatten_start', text='起始正交', toggle=True)
-        row.prop(scene, 'rail_flatten_end', text='结束正交', toggle=True)
+        row.prop(scene, 'rail_flatten_start', text=_t('squared_start'), toggle=True)
+        row.prop(scene, 'rail_flatten_end', text=_t('squared_end'), toggle=True)
+        row = col.row(align=True)
+        corner_on = bool(getattr(scene, 'rail_corner_sharp', True))
+        row.prop(scene, 'rail_corner_sharp', text=_t('corner_sharp'),
+                 toggle=True,
+                 icon='CHECKBOX_HLT' if corner_on else 'CHECKBOX_DEHLT')
+        row.prop(scene, 'rail_corner_angle', text=_t('corner_angle'))
+        row = col.row(align=True)
+        row.prop(scene, 'rail_corner_segments', text=_t('corner_segments'))
+        row.prop(scene, 'rail_corner_radius', text=_t('corner_radius'), slider=True)
         row = col.row(align=True)
         row.scale_y = 1.2
-        row.prop(scene, 'rail_make_loop', text='闭合路径', toggle=True, icon='MESH_CIRCLE')
+        row.prop(scene, 'rail_make_loop', text=_t('closed_path'), toggle=True, icon='MESH_CIRCLE')
         # 截面吸附开关
-        snap = bool(getattr(scene, 'rail_snap_profile_to_path', True))
+        snap = bool(getattr(scene, 'rail_snap_profile_to_path', False))
         row = col.row(align=True)
         row.scale_y = 1.2
         row.prop(scene, 'rail_snap_profile_to_path',
-                 text='截面吸附到路径',
+                 text=_t('snap_profile'),
                  toggle=True,
                  icon='CHECKBOX_HLT' if snap else 'CHECKBOX_DEHLT')
         col = layout.column()
         col.scale_y = 2.2
-        btn_text = '执行路径跟随'
+        btn_text = _t('generate')
         if context.scene.get('is_already_extruded', False):
-            btn_text = '路径跟随'
+            btn_text = _t('update_btn')
         col.operator('mesh.punten_naar_mesh', text=btn_text, icon='MOD_SCREW')
 
 # ═══════════════════════════════════════════════════════════
@@ -3216,7 +3636,33 @@ classes = [
     MESH_OT_spiegel_profiel, MESH_OT_rotate_profile_step,
     MESH_OT_wissel_richting, MESH_OT_toggle_z_up,
     MESH_OT_reset_path_mapping, VIEW_PT_etrude_mesh,
+    PATHFOLLOW_OT_toggle_language, PathFollowPreferences,
 ]
+
+# 算子在搜索菜单里的英文名称（英文界面时生效）
+_OPERATOR_LABELS_EN = {
+    MESH_OT_select_rail: 'Select Rail',
+    MESH_OT_select_profile: 'Select Profile',
+    MESH_OT_apply_rail_follow: 'Apply Final Object',
+    MESH_OT_puntenlijst: 'Compute Path Points',
+    MESH_OT_punten_naar_mesh: 'Path Follow Generate',
+    MESH_OT_profiel_vlak: 'Align Profile',
+    MESH_OT_spiegel_profiel: 'Mirror Profile',
+    MESH_OT_rotate_profile_step: 'Rotate Profile 90°',
+    MESH_OT_wissel_richting: 'Reverse Path',
+    MESH_OT_toggle_z_up: 'Toggle Keep Z Up',
+    MESH_OT_reset_path_mapping: 'Reset Path Mapping',
+}
+
+def _apply_operator_labels():
+    English = _ui_lang() == 'en'
+    for cls, en_label in _OPERATOR_LABELS_EN.items():
+        try:
+            if not hasattr(cls, '_original_bl_label'):
+                cls._original_bl_label = cls.bl_label
+            cls.bl_label = en_label if English else cls._original_bl_label
+        except Exception:
+            pass
 
 def register():
     global RAIL_OPERATOR_TRANSACTION_DEPTH, RAIL_UNDO_REDO_RELEASE_TIMER
@@ -3234,37 +3680,60 @@ def register():
 
     for c in classes:
         bpy.utils.register_class(c)
+    try: _apply_operator_labels()
+    except Exception: pass
 
     bpy.types.Scene.rail_gen_resolution = bpy.props.IntProperty(
-        name='曲线分辨率', default=24, min=2,
+        name='Segments', default=24, min=2,
         get=get_resolution_proxy, set=set_resolution_proxy)
     bpy.types.Scene.rail_cap_start = bpy.props.BoolProperty(
-        name='起始封口', default=True, update=update_gen_mesh)
+        name='Cap Start', default=True, update=update_gen_mesh)
     bpy.types.Scene.rail_cap_end = bpy.props.BoolProperty(
-        name='结束封口', default=True, update=update_gen_mesh)
+        name='Cap End', default=True, update=update_gen_mesh)
     bpy.types.Scene.rail_make_loop = bpy.props.BoolProperty(
-        name='闭合路径', default=False, update=update_gen_mesh)
+        name='Closed Path', default=False, update=update_gen_mesh)
     bpy.types.Scene.rail_flatten_start = bpy.props.BoolProperty(
-        name='起始正交化', default=False,
-        description='强制起始截面平行于最接近的全局平面', update=update_gen_mesh)
+        name='Square Start', default=False,
+        description='强制起始截面平行于最接近的全局平面 / Force start section onto nearest global plane',
+        update=update_gen_mesh)
     bpy.types.Scene.rail_flatten_end = bpy.props.BoolProperty(
-        name='结束正交化', default=False,
-        description='强制结束截面平行于最接近的全局平面', update=update_gen_mesh)
+        name='Square End', default=False,
+        description='强制结束截面平行于最接近的全局平面 / Force end section onto nearest global plane',
+        update=update_gen_mesh)
+    # 新增：拐角锐化
+    bpy.types.Scene.rail_corner_sharp = bpy.props.BoolProperty(
+        name='Sharp Corners', default=True,
+        description='在急拐角处让拐角截面垂直于进入段，生成水密的锐边直角 / '
+                    'At sharp corners the section is perpendicular to the incoming segment (watertight edge)',
+        update=update_gen_mesh)
+    bpy.types.Scene.rail_corner_angle = bpy.props.FloatProperty(
+        name='Corner Angle',
+        description='相邻路径段之间的夹角超过该角度时视为拐角 / Turn angle above which a corner is detected',
+        default=math.radians(30.0), min=math.radians(5.0), max=math.radians(89.0),
+        subtype='ANGLE', update=update_gen_mesh)
+    bpy.types.Scene.rail_corner_segments = bpy.props.IntProperty(
+        name='Corner Segments', default=0, min=0, max=24,
+        description='拐角圆弧的分段数：大于 0 时拐角生成圆弧过渡 / Arc resolution for rounded corners; 0 = off',
+        update=update_gen_mesh)
+    bpy.types.Scene.rail_corner_radius = bpy.props.FloatProperty(
+        name='Corner Radius', default=0.35, min=0.05, max=0.45, subtype='FACTOR',
+        description='圆角半径占较短邻段长度的比例 / Fillet radius as a fraction of the shorter adjacent segment',
+        update=update_gen_mesh)
     bpy.types.Scene.rail_map_start = bpy.props.FloatProperty(
-        name='开始映射', description='控制截面从路径长度的哪个百分比位置开始生成',
+        name='Mapping Start', description='控制截面从路径长度的哪个百分比位置开始生成',
         default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=update_path_mapping)
     bpy.types.Scene.rail_map_end = bpy.props.FloatProperty(
-        name='结束映射', description='控制截面生成到路径长度的哪个百分比位置结束',
+        name='Mapping End', description='控制截面生成到路径长度的哪个百分比位置结束',
         default=1.0, min=0.0, max=1.0, subtype='FACTOR', update=update_path_mapping)
     bpy.types.Scene.rail_auto_update = bpy.props.BoolProperty(
-        name='自动更新', description='编辑路径或轮廓时，自动更新挤出模型',
+        name='Live Update', description='编辑路径或轮廓时，自动更新挤出模型',
         default=False, update=update_gen_mesh)
     # 新增：截面吸附开关
     bpy.types.Scene.rail_snap_profile_to_path = bpy.props.BoolProperty(
-        name='截面吸附到路径',
+        name='Snap Profile to Path',
         description='执行路径跟随时，将原截面物体吸附到路径起点；'
                     '关闭时原截面保留在原位，放样使用其副本',
-        default=True)
+        default=False)
 
     if rail_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(rail_depsgraph_handler)
@@ -3323,6 +3792,14 @@ def unregister():
     del bpy.types.Scene.rail_make_loop
     del bpy.types.Scene.rail_flatten_start
     del bpy.types.Scene.rail_flatten_end
+    if hasattr(bpy.types.Scene, 'rail_corner_sharp'):
+        del bpy.types.Scene.rail_corner_sharp
+    if hasattr(bpy.types.Scene, 'rail_corner_angle'):
+        del bpy.types.Scene.rail_corner_angle
+    if hasattr(bpy.types.Scene, 'rail_corner_segments'):
+        del bpy.types.Scene.rail_corner_segments
+    if hasattr(bpy.types.Scene, 'rail_corner_radius'):
+        del bpy.types.Scene.rail_corner_radius
     del bpy.types.Scene.rail_map_start
     del bpy.types.Scene.rail_map_end
     if hasattr(bpy.types.Scene, 'rail_auto_update'):
