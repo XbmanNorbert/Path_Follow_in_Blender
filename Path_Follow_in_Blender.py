@@ -10,7 +10,7 @@ bl_info = {
     'author': 'Xbman',
     'description': '选中路径和截面，路径为活动物体，选中后执行放样',
     'blender': (2, 80, 0),
-    'version': (1, 1, 1),
+    'version': (1, 1, 2),
     'location': '3D视图 > 侧边栏 > 路径跟随标签页',
     'category': '网格',
 }
@@ -3602,6 +3602,10 @@ _UI_TEXTS = {
         'corner_sharp': '拐角锐化', 'corner_angle': '角度',
         'corner_segments': '拐角分段', 'corner_radius': '圆角半径',
         'generate': '执行路径跟随', 'update_btn': '路径跟随',
+        # 侧边栏分组标题（每个圈一组，可用小三角收纳 / 展开）
+        'grp_align': '对齐轮廓', 'grp_update': '更新与朝向',
+        'grp_mapping': '路径映射', 'grp_caps': '封口与拐角',
+        'grp_run': '执行',
     },
     'en': {
         'lang': 'Interface Language',
@@ -3618,6 +3622,10 @@ _UI_TEXTS = {
         'corner_sharp': 'Sharp Corners', 'corner_angle': 'Angle',
         'corner_segments': 'Corner Segments', 'corner_radius': 'Radius',
         'generate': 'Generate Path Follow', 'update_btn': 'Update Path Follow',
+        # Sidebar group titles
+        'grp_align': 'Align Profile', 'grp_update': 'Update & Orientation',
+        'grp_mapping': 'Path Mapping', 'grp_caps': 'Caps & Corners',
+        'grp_run': 'Run',
     },
 }
 
@@ -3682,6 +3690,8 @@ class PATHFOLLOW_OT_toggle_language(bpy.types.Operator):
             return {'CANCELLED'}
         try: _apply_operator_labels()
         except Exception: pass
+        try: _apply_panel_labels()
+        except Exception: pass
         return {'FINISHED'}
 
 # ═══════════════════════════════════════════════════════════
@@ -3733,8 +3743,38 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
             split.label(text=f'{target_rail_ob.name}', icon=icon_style)
             split.prop(scene, 'rail_gen_resolution', text=_t('segments'))
 
-        box_ops = layout.box()
-        col = box_ops.column(align=True)
+        # 上面只保留"路径信息"。下面是 5 个分组子面板（对齐轮廓 / 更新与镜像 /
+        # 路径映射 / 封口与拐角 / 执行），每个都可以用小三角收纳起来。
+
+# ── 分组子面板 ─────────────────────────────────────────────
+# 用 bl_parent_id 挂到主面板下，侧边栏里就是一行可折叠的标题（前面带小三角）。
+# 顺序由 bl_order 决定（数值小的在上）；类名也按 1..5 字典序排列，
+# 这样即使某版本不认 bl_order，退化成按 idname 排序也是同样的顺序。
+class _PF_SUB_PANEL(bpy.types.Panel):
+    """分组子面板基类：只承载公共属性，本身不注册。"""
+    bl_category = 'Path Follow'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_parent_id = 'VIEW_PT_etrude_mesh'
+    # 默认收起，点标题前的小三角展开
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        # 折叠标题右侧的图标，纯装饰，帮助快速辨认分组
+        try:
+            self.layout.label(text='', icon=getattr(self, '_pf_header_icon', 'NONE'))
+        except Exception:
+            pass
+
+
+class VIEW_PT_pf_1_align(_PF_SUB_PANEL):
+    """截图红圈：截面在路径起点平面上的九宫格对齐。"""
+    bl_label = _t('grp_align')
+    bl_order = 1
+    _pf_header_icon = 'ORIENTATION_GLOBAL'
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
         row = col.row(align=True)
         row.operator('mesh.profiel_vlak', text='↖').align_pos = 'TL'
         row.operator('mesh.profiel_vlak', text='↑').align_pos = 'TM'
@@ -3747,15 +3787,25 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
         row.operator('mesh.profiel_vlak', text='↙').align_pos = 'BL'
         row.operator('mesh.profiel_vlak', text='↓').align_pos = 'BM'
         row.operator('mesh.profiel_vlak', text='↘').align_pos = 'BR'
-        col.separator()
+
+
+class VIEW_PT_pf_2_update(_PF_SUB_PANEL):
+    """截图绿圈：实时更新、镜像、旋转、首尾反转、Z 轴向上。"""
+    bl_label = _t('grp_update')
+    bl_order = 2
+    _pf_header_icon = 'FILE_REFRESH'
+
+    def draw(self, context):
+        scene = context.scene
+        col = self.layout.column(align=True)
         row = col.row()
         row.prop(scene, 'rail_auto_update', text=_t('auto_update'), icon='PLAY')
         col.separator()
         row = col.row(align=True)
-        is_mx = context.scene.get('rail_mirror_x', False)
+        is_mx = scene.get('rail_mirror_x', False)
         row.operator('mesh.spiegel_profiel', text=_t('mirror_x'),
                      icon='CHECKBOX_HLT' if is_mx else 'CHECKBOX_DEHLT').axis = 'X'
-        is_my = context.scene.get('rail_mirror_y', False)
+        is_my = scene.get('rail_mirror_y', False)
         row.operator('mesh.spiegel_profiel', text=_t('mirror_y'),
                      icon='CHECKBOX_HLT' if is_my else 'CHECKBOX_DEHLT').axis = 'Y'
         row = col.row(align=True)
@@ -3766,21 +3816,39 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
         row.operator('mesh.wissel_richting', text=_t('reverse_path'), icon='FILE_REFRESH')
         row = col.row(align=True)
         row.scale_y = 1.2
-        is_z = context.scene.get('rail_z_up', False)
+        is_z = scene.get('rail_z_up', False)
         row.operator('mesh.toggle_z_up', text=_t('keep_z_up'),
                      icon='CHECKBOX_HLT' if is_z else 'CHECKBOX_DEHLT')
-        col.separator()
-        map_box = col.box()
-        map_col = map_box.column(align=True)
-        map_col.label(text=_t('mapping'))
-        row = map_col.row(align=True)
+
+
+class VIEW_PT_pf_3_mapping(_PF_SUB_PANEL):
+    """截图黄圈：截面沿路径长度的起止映射。"""
+    bl_label = _t('grp_mapping')
+    bl_order = 3
+    _pf_header_icon = 'ARROW_LEFTRIGHT'
+
+    def draw(self, context):
+        try: _sync_mapping_panel_to_active(context)
+        except Exception: pass
+        scene = context.scene
+        col = self.layout.column(align=True)
+        row = col.row(align=True)
         row.prop(scene, 'rail_map_start', text=_t('map_start'), slider=True)
-        row = map_col.row(align=True)
+        row = col.row(align=True)
         row.prop(scene, 'rail_map_end', text=_t('map_end'), slider=True)
-        row = map_col.row(align=True)
+        row = col.row(align=True)
         row.operator('mesh.reset_path_mapping', text=_t('map_reset'), icon='FILE_REFRESH')
-        layout.separator()
-        col = layout.column(align=True)
+
+
+class VIEW_PT_pf_4_caps(_PF_SUB_PANEL):
+    """截图青/蓝圈：封口、正交、拐角处理、闭合路径、截面吸附。"""
+    bl_label = _t('grp_caps')
+    bl_order = 4
+    _pf_header_icon = 'MOD_SCREW'
+
+    def draw(self, context):
+        scene = context.scene
+        col = self.layout.column(align=True)
         row = col.row(align=True)
         row.prop(scene, 'rail_cap_start', text=_t('cap_start'), toggle=True)
         row.prop(scene, 'rail_cap_end', text=_t('cap_end'), toggle=True)
@@ -3807,12 +3875,23 @@ class VIEW_PT_etrude_mesh(bpy.types.Panel):
                  text=_t('snap_profile'),
                  toggle=True,
                  icon='CHECKBOX_HLT' if snap else 'CHECKBOX_DEHLT')
-        col = layout.column()
+
+
+class VIEW_PT_pf_5_run(_PF_SUB_PANEL):
+    """生成按钮单独成组，保证它排在最下面且始终可见（默认不折叠）。"""
+    bl_label = _t('grp_run')
+    bl_order = 5
+    _pf_header_icon = 'PLAY'
+    bl_options = set()
+
+    def draw(self, context):
+        col = self.layout.column()
         col.scale_y = 2.2
         btn_text = _t('generate')
         if context.scene.get('is_already_extruded', False):
             btn_text = _t('update_btn')
         col.operator('mesh.punten_naar_mesh', text=btn_text, icon='MOD_SCREW')
+
 
 # ═══════════════════════════════════════════════════════════
 # 注册 / 注销
@@ -3823,8 +3902,20 @@ classes = [
     MESH_OT_spiegel_profiel, MESH_OT_rotate_profile_step,
     MESH_OT_wissel_richting, MESH_OT_toggle_z_up,
     MESH_OT_reset_path_mapping, VIEW_PT_etrude_mesh,
+    # 分组子面板：必须排在主面板之后注册，bl_parent_id 才能找到父面板
+    VIEW_PT_pf_1_align, VIEW_PT_pf_2_update, VIEW_PT_pf_3_mapping,
+    VIEW_PT_pf_4_caps, VIEW_PT_pf_5_run,
     PATHFOLLOW_OT_toggle_language, PathFollowPreferences,
 ]
+
+# 分组子面板 → 翻译表键名（中英文标题统一取自 _UI_TEXTS，避免两处硬编码不同步）
+_PANEL_LABEL_KEYS = {
+    VIEW_PT_pf_1_align: 'grp_align',
+    VIEW_PT_pf_2_update: 'grp_update',
+    VIEW_PT_pf_3_mapping: 'grp_mapping',
+    VIEW_PT_pf_4_caps: 'grp_caps',
+    VIEW_PT_pf_5_run: 'grp_run',
+}
 
 # 算子在搜索菜单里的英文名称（英文界面时生效）
 _OPERATOR_LABELS_EN = {
@@ -3851,6 +3942,25 @@ def _apply_operator_labels():
         except Exception:
             pass
 
+def _apply_panel_labels():
+    """给分组子面板按当前语言设置标题。改完 bl_label 后需要重新注册，
+    面板标题才会立即刷新（否则要重启 Blender 才生效）。"""
+    English = _ui_lang() == 'en'
+    table = _UI_TEXTS['en' if English else 'zh']
+    for cls, key in _PANEL_LABEL_KEYS.items():
+        try:
+            new_label = table.get(key) or _UI_TEXTS['zh'].get(key) or key
+            if cls.bl_label == new_label:
+                continue
+            cls.bl_label = new_label
+            try:
+                bpy.utils.unregister_class(cls)
+                bpy.utils.register_class(cls)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
 def register():
     global RAIL_OPERATOR_TRANSACTION_DEPTH, RAIL_UNDO_REDO_RELEASE_TIMER
     global _draw_handler, RAIL_UNDO_REDO_GUARD, RAIL_FORCE_NO_UNDO
@@ -3868,6 +3978,8 @@ def register():
     for c in classes:
         bpy.utils.register_class(c)
     try: _apply_operator_labels()
+    except Exception: pass
+    try: _apply_panel_labels()
     except Exception: pass
 
     bpy.types.Scene.rail_gen_resolution = bpy.props.IntProperty(
